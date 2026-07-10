@@ -57,8 +57,14 @@ function FEA_VoxelBasedDiscretization()
 	meshHierarchy_.resY = adjustedNely; ny = meshHierarchy_.resY;
 	meshHierarchy_.resZ = adjustedNelz; nz = meshHierarchy_.resZ;
 	meshHierarchy_.eleSize = (boundingBox_(2,:) - boundingBox_(1,:)) ./ [nx ny nz];
+    % Optional: full-grid element modulus.
+    % If all solid elements have the same modulus, you do NOT need this.
+    % But if CUDA expects Egrid, this gives one value per full-grid voxel.
 
+    meshHierarchy_(1).eGrid = zeros(numel(voxelizedVolume_), 1, 'single');
+    meshHierarchy_(1).eGrid(voxelizedVolume_(:)) = single(1.0);
 	%%4. identify solid&void elements
+
 	voxelizedVolume_ = voxelizedVolume_(:);
 	meshHierarchy_.eleMapBack = find(voxelizedVolume_);
 	meshHierarchy_.eleMapBack = int32(meshHierarchy_.eleMapBack);
@@ -117,7 +123,99 @@ function FEA_VoxelBasedDiscretization()
 	end
 	allNodes(meshHierarchy_.nodesOnBoundary) = (1:numel(meshHierarchy_.nodesOnBoundary))';
 	meshHierarchy_.boundaryEleFaces = allNodes(meshHierarchy_.boundaryEleFaces);
-	
+  
+	%%% TODO.CHECK
+	nodeToElements = zeros(meshHierarchy_(1).numNodes, 8, 'int32');
+	nodeToElementsCount = zeros(meshHierarchy_(1).numNodes, 1, 'int32');
+
+	for ee = 1:meshHierarchy_(1).numElements
+		for nn = 1:8
+			iNode = eNodMat(ee, nn);
+			nodeToElementsCount(iNode) = nodeToElementsCount(iNode) + 1;
+			slot = nodeToElementsCount(iNode);
+
+			if slot <= 8
+				nodeToElements(iNode, slot) = ee;
+			else
+				error('Node touches more than 8 active elements.');
+			end
+		end
+	end
+
+	meshHierarchy_(1).nodeToElements = nodeToElements;
+	%% DEBUG: verify nodeToElements construction
+
+	fprintf('Checking nodeToElements...\n');
+
+	% 1. Count consistency
+	countDiff = double(nodeToElementsCount) - double(meshHierarchy_(1).numNod2ElesVec);
+
+	fprintf('max abs count diff: %d\n', max(abs(countDiff)));
+
+	if any(countDiff ~= 0)
+		error('nodeToElementsCount does not match numNod2ElesVec.');
+	end
+
+	% 2. Every listed element must actually contain the node
+	badPairs = 0;
+
+	sampleNodes = round(linspace(1, meshHierarchy_(1).numNodes, min(10000, meshHierarchy_(1).numNodes)));
+
+	for node = sampleNodes
+		elems = nodeToElements(node, :);
+		elems = elems(elems > 0);
+
+		for kk = 1:numel(elems)
+			elem = elems(kk);
+
+			if ~any(eNodMat(elem, :) == node)
+				badPairs = badPairs + 1;
+
+				fprintf('BAD PAIR:\n');
+				fprintf('node = %d\n', node);
+				fprintf('elem = %d\n', elem);
+				fprintf('nodeToElements(node,:) = \n');
+				disp(nodeToElements(node, :));
+				fprintf('eNodMat(elem,:) = \n');
+				disp(eNodMat(elem, :));
+
+				error('nodeToElements contains an element that does not contain the node.');
+			end
+		end
+	end
+
+	fprintf('nodeToElements listed-pair check passed.\n');
+
+	% 3. Every element-node pair must be represented in nodeToElements
+	missingPairs = 0;
+
+	sampleElems = round(linspace(1, meshHierarchy_(1).numElements, min(10000, meshHierarchy_(1).numElements)));
+
+	for elem = sampleElems
+		nodes = eNodMat(elem, :);
+
+		for jj = 1:8
+			node = nodes(jj);
+
+			if ~any(nodeToElements(node, :) == elem)
+				missingPairs = missingPairs + 1;
+
+				fprintf('MISSING PAIR:\n');
+				fprintf('elem = %d\n', elem);
+				fprintf('node = %d\n', node);
+				fprintf('eNodMat(elem,:) = \n');
+				disp(eNodMat(elem, :));
+				fprintf('nodeToElements(node,:) = \n');
+				disp(nodeToElements(node, :));
+
+				error('nodeToElements is missing an element-node relation.');
+			end
+		end
+	end
+
+	fprintf('nodeToElements reverse-pair check passed.\n');
+	fprintf('nodeToElements check completed.\n');
+    
 	%%7. 
 	% nodeCoords_ = zeros((nx+1)*(ny+1)*(nz+1),3);
 	xSeed = boundingBox_(1,1):(boundingBox_(2,1)-boundingBox_(1,1))/nx:boundingBox_(2,1); xSeed = single(xSeed);

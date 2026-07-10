@@ -135,7 +135,33 @@ function Solving_BuildingMeshHierarchy()
 		%%5. initialize multi-grid Restriction&Interpolation operator
 		meshHierarchy_(ii).multiGridOperatorRI = Solving_Operator4MultiGridRestrictionAndInterpolation('inNODE', spanWidth);
 		meshHierarchy_(ii).multiGridOperatorRIdense = full(meshHierarchy_(ii).multiGridOperatorRI);
-		
+
+		%%7: identify active voxels touching active nodes
+		% nodeToElements(localNode, :) stores up to 8 active coarse elements
+		% touching that active node. 0 means empty slot.
+
+		meshHierarchy_(ii).eNodMat = int32(eNodMat);
+
+		nodeToElements = zeros(meshHierarchy_(ii).numNodes, 8, 'int32');
+		nodeToElementsCount = zeros(meshHierarchy_(ii).numNodes, 1, 'int32');
+
+		for ee = 1:meshHierarchy_(ii).numElements
+			for nn = 1:8
+				iNode = eNodMat(ee, nn);  % already local active-node id
+
+				nodeToElementsCount(iNode) = nodeToElementsCount(iNode) + 1;
+				slot = nodeToElementsCount(iNode);
+
+				if slot <= 8
+					nodeToElements(iNode, slot) = ee;
+				else
+					error('Node touches more than 8 elements. This should not happen for a structured hex mesh.');
+				end
+			end
+		end
+
+		meshHierarchy_(ii).nodeToElements = nodeToElements;
+
 		%%6. identify boundary info.
 		% meshHierarchy_(ii).numNod2ElesVec = zeros(meshHierarchy_(ii).numNodes,1,'int32');
 		% for jj=1:8

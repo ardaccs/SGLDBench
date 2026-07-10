@@ -1,0 +1,4 @@
+Reported GPU memory. Total: 4194176 kb Free: 3448012 kb
+Number of dofs 133894539, Device memory required 9140 (Mb)
+MGCG Initial residual=   0.0493821
+MGCG Nit=2  Time      374  Final residual=     0.30488

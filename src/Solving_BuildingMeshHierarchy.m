@@ -120,6 +120,10 @@ function Solving_BuildingMeshHierarchy()
 		end
 		eNodMatHalfTemp_ = eNodMatHalfTemp_(:,[3 4 7 8]);
 		meshHierarchy_(ii).nodMapBack = unique(eNodMat);
+
+		%%Arda:Addition for non-dyadic mesh hierarchy
+		%% Keep the node numbering relative to this level's full Cartesian grid.
+		meshHierarchy_(ii).nodGridId = int32(meshHierarchy_(ii).nodMapBack);
 		meshHierarchy_(ii).numNodes = length(meshHierarchy_(ii).nodMapBack);
 		meshHierarchy_(ii).numDOFs = meshHierarchy_(ii).numNodes*3;
 		meshHierarchy_(ii).nodMapForward = zeros((nx+1)*(ny+1)*(nz+1),1,'int32');
@@ -162,6 +166,33 @@ function Solving_BuildingMeshHierarchy()
 			% meshHierarchy_(ii).boundaryEleFaces(end+1:end+size(iBoundaryEleFaces,2),:) = iBoundaryEleFaces';
 		% end
 		meshHierarchy_(ii).eNodMat = eNodMat;
+		
+		%%7: identify active voxels touching active nodes
+		% nodeToElements(localNode, :) stores up to 8 active coarse elements
+		% touching that active node. 0 means empty slot.
+
+		meshHierarchy_(ii).eNodMat = int32(eNodMat);
+
+		nodeToElements = zeros(meshHierarchy_(ii).numNodes, 8, 'int32');
+		nodeToElementsCount = zeros(meshHierarchy_(ii).numNodes, 1, 'int32');
+
+		for ee = 1:meshHierarchy_(ii).numElements
+			for nn = 1:8
+				iNode = eNodMat(ee, nn);  % already local active-node id
+
+				nodeToElementsCount(iNode) = nodeToElementsCount(iNode) + 1;
+				slot = nodeToElementsCount(iNode);
+
+				if slot <= 8
+					nodeToElements(iNode, slot) = ee;
+				else
+					error('Node touches more than 8 elements. This should not happen for a structured hex mesh.');
+				end
+			end
+		end
+
+		meshHierarchy_(ii).nodeToElements = nodeToElements;
+
 	end	
 	clear -global eNodMatHalfTemp_
 	

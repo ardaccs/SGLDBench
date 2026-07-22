@@ -36,11 +36,9 @@ __global__ void kbyu_kernel(
     const int32_t* __restrict__ eNodMat,        // [numElements x 8], MATLAB column-major
 
     const double* __restrict__ E,               // [numElements]
-    const double* __restrict__ Ke,              // [24 x 24], MATLAB column-major
 
     int numNodes,
-    int numElements,
-    int nx, int ny, int nz)
+    int numElements)
 {
     // This kernel performs a node based gather operative matrix free matrix-vector multiplication
     // Each thread owns an active node, thus there is numNodes threads
@@ -66,7 +64,7 @@ __global__ void kbyu_kernel(
             continue;
 
         //TODO.When you first load or build your nodeToElements and eNodMat arrays in MATLAB or C++, run a quick validation pass there once.
-        //int localNode = -1;
+        int localNode = -1;
 
         // Gather the 8 global nodes of this element from eNodMat(elem, :).
         #pragma unroll
@@ -74,9 +72,8 @@ __global__ void kbyu_kernel(
         {
             int n = eNodMat[elem + j * numElements] - 1;
             elemNodes[j] = n;
-            /*            if (n == node)
-                localNode = j;*/
-
+            if (n == node)
+                localNode = j;
         }
         /*// If this happens, nodeToElements/eNodMat are inconsistent.
         if (localNode < 0)
@@ -103,7 +100,7 @@ __global__ void kbyu_kernel(
             Ue[3*j + 1] = U[base + 1];
             Ue[3*j + 2] = U[base + 2];
         }
-        / Current node corresponds to local rows:
+        // Current node corresponds to local rows:
         //
         //   row0 + 0
         //   row0 + 1
@@ -141,4 +138,82 @@ __global__ void kbyu_kernel(
     Y[out + 1] = sum1;
     Y[out + 2] = sum2;
 
+}
+
+void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[])
+{
+    // inputs:
+    // U, Ke, nodMapBack, nodMapForward, eleMapForward, E, nx, ny, nz
+
+    if (nrhs != 8) {
+        mexErrMsgIdAndTxt("sgld:nrhs", "Need 8 inputs.");
+    }
+
+    const mxArray* U_mx = prhs[0];
+    const mxArray* nodeToElements_mx = prhs[1];
+    const mxArray* eNodMat_mx = prhs[2];
+    const mxArray* Ke_mx = prhs[3];
+    const mxArray* E_mx = prhs[4];
+
+    int nx = (int)mxGetScalar(prhs[5]);
+    int ny = (int)mxGetScalar(prhs[6]);
+    int nz = (int)mxGetScalar(prhs[7]);
+
+    int numDOFs = (int)mxGetNumberOfElements(U_mx);
+    int numNodes = numDOFs / 3;
+    int numElements = (int)mxGetNumberOfElements(E_mx);
+
+    const double* h_U = mxGetDoubles(U_mx);
+    const double* h_Ke = mxGetDoubles(Ke_mx);
+    const int32_t* h_nodeToElements =
+        static_cast<const int32_t*>(mxGetData(nodeToElements_mx));
+
+    const int32_t* h_eNodMat = static_cast<const int32_t*>(mxGetData(eNodMat_mx));
+    const double* h_E = mxGetDoubles(E_mx);
+
+    plhs[0] = mxCreateDoubleMatrix(numDOFs, 1, mxREAL);
+    double* h_Y = mxGetDoubles(plhs[0]);
+
+    double *d_U, *d_Y, *d_E;
+    int32_t *d_nodeToElements, *d_eNodMat;
+
+    CUDA_CHECK(cudaMalloc(&d_U, numDOFs * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_Y, numDOFs * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_E, numElements * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_nodeToElements, numNodes * 8 * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_eNodMat, numElements * 8 * sizeof(int32_t)));
+
+
+
+    CUDA_CHECK(cudaMemcpy(d_U, h_U, numDOFs * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_Y, h_Y, numDOFs * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_nodeToElements, h_nodeToElements, numNodes * 8 * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_eNodMat, h_eNodMat, numElements * 8 * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_E, h_E, numElements * sizeof(double), cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemcpyToSymbol(c_Ke, h_Ke, 24 * 24 * sizeof(double)));
+
+    int block = 256;
+    int grid = (numNodes + block - 1) / block;
+
+    kbyu_kernel<<<grid, block>>>(
+        d_U,
+        d_Y,
+        d_nodeToElements,
+        d_eNodMat,
+        d_E,
+        numNodes,
+        numElements
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(h_Y, d_Y, numDOFs * sizeof(double), cudaMemcpyDeviceToHost));
+
+    cudaFree(d_U);
+    cudaFree(d_Y);
+    cudaFree(d_E);
+    cudaFree(d_nodeToElements);
+    cudaFree(d_eNodMat);
 }

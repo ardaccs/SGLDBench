@@ -117,7 +117,27 @@ function FEA_VoxelBasedDiscretization()
 	end
 	allNodes(meshHierarchy_.nodesOnBoundary) = (1:numel(meshHierarchy_.nodesOnBoundary))';
 	meshHierarchy_.boundaryEleFaces = allNodes(meshHierarchy_.boundaryEleFaces);
-	
+
+	%%% TODO.CHECK
+	nodeToElements = zeros(meshHierarchy_(1).numNodes, 8, 'int32');
+	nodeToElementsCount = zeros(meshHierarchy_(1).numNodes, 1, 'int32');
+
+	for ee = 1:meshHierarchy_(1).numElements
+		for nn = 1:8
+			iNode = eNodMat(ee, nn);
+			nodeToElementsCount(iNode) = nodeToElementsCount(iNode) + 1;
+			slot = nodeToElementsCount(iNode);
+
+			if slot <= 8
+				nodeToElements(iNode, slot) = ee;
+			else
+				error('Node touches more than 8 active elements.');
+			end
+		end
+	end
+	meshHierarchy_(1).nodeToElements = nodeToElements;
+	meshHierarchy_(1).nodGridId = int32(meshHierarchy_(1).nodMapBack);
+
 	%%7. 
 	% nodeCoords_ = zeros((nx+1)*(ny+1)*(nz+1),3);
 	xSeed = boundingBox_(1,1):(boundingBox_(2,1)-boundingBox_(1,1))/nx:boundingBox_(2,1); xSeed = single(xSeed);

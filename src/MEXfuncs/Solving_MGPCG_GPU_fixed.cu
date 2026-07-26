@@ -2023,14 +2023,14 @@ static void initializeCoarseSolver(
             n,
             solver.coarseNNZ,
             solver.d_coarseRowOffsets,
-            solver.d_coarseRowOffsets + 1,
+            nullptr,
             solver.d_coarseColIndices,
             solver.d_coarseValues,
             CUDSS_R_32I,
             CUDSS_R_32I,
             CUDSS_R_64F,
             CUDSS_MTYPE_SPD,
-            CUDSS_MVIEW_FULL,
+            CUDSS_MVIEW_LOWER,
             CUDSS_BASE_ZERO));
 
     CUDSS_CHECK(

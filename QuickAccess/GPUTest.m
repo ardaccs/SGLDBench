@@ -75,9 +75,24 @@ if isempty(mexPath)
         'Solving_MGPCG_GPU was not found. ', ...
         'Compile the CUDA MEX and add its directory to the MATLAB path.']);
 end
+b  = full(double(b(:)));
+y0 = full(double(y0(:)));
 
+for level = 1:H.numLevels-1
+    H.diagK{level} = full(double(H.diagK{level}(:)));
+end
+
+H.eleModulus{1} = full(double(H.eleModulus{1}(:)));
+H.Ke = full(double(H.Ke));
 fprintf('Using CUDA MEX:\n%s\n', mexPath);
+fprintf('issparse(b)  = %d\n', issparse(b));
+fprintf('issparse(y0) = %d\n', issparse(y0));
+fprintf('issparse(Ke) = %d\n', issparse(H.Ke));
 
+for level = 1:H.numLevels-1
+    fprintf('issparse(diagK{%d}) = %d\n', ...
+        level, issparse(H.diagK{level}));
+end
 gpuTimer = tic;
 
 [U_gpu, gpuIterations, gpuReportedRelres] = ...

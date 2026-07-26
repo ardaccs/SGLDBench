@@ -68,7 +68,7 @@ assert(all(isfinite(nonzeros(H_.coarseKFree))), ...
 %% 4.3 CUDA solve
 fprintf('\n--- Running CUDA MGPCG ---\n');
 
-mexPath = which('Solving_MGPCG_GPU');
+mexPath = which('Solving_MGPCG_GPU_coarse_pcg');
 
 if isempty(mexPath)
     error([ ...

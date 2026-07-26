@@ -3,9 +3,13 @@
 
 #include <cuda_runtime.h>
 
+#include <cublas_v2.h>
 #include <cstdint>
 #include <climits>
 #include <cstdio>
+#include <vector>
+
+// TODO. Add checks especially ones in the SGLDBench mex files and mgpcg9
 
 // Elementary stiffness matrix (4.6 kB)
 __constant__ double c_Ke[24 * 24];
@@ -28,8 +32,8 @@ __constant__ double c_Ke[24 * 24];
         mexEvalString("drawnow;");                                           \
     } while (0)
 
-// One LevelGPU represents one of these:LevelGPU 0 → meshHierarchy_(1), LevelGPU 1 → meshHierarchy_(2)
-struct LevelGPU
+// One Levelrepresents one of these:Level 0 → meshHierarchy_(1), Level 1 → meshHierarchy_(2)
+struct Level
 {
     int nx = 0;
     int ny = 0;
@@ -41,47 +45,69 @@ struct LevelGPU
 
     size_t numGridNodes = 0;
 
-    /*
-     * Static hierarchy data.
-     */
+    // MATLAB/CPU source pointers.
+    const int32_t* h_nodeToElements = nullptr;
+    const int32_t* h_eNodMat = nullptr;
+    const int32_t* h_nodGridId = nullptr;
+    const int32_t* h_nodMapForward = nullptr;
+
+    const double* h_eleModulus = nullptr;
+    const double* h_dK = nullptr;
+
+    // CUDA device pointers.
     int32_t* d_nodeToElements = nullptr;
     int32_t* d_eNodMat = nullptr;
     int32_t* d_nodGridId = nullptr;
     int32_t* d_nodMapForward = nullptr;
 
-    /*
-     * Material values.
-     */
     double* d_eleModulus = nullptr;
+    double* d_dK = nullptr;
 
-    /*
-     * Multigrid working vectors.
-     */
     double* d_rhs = nullptr;
     double* d_x = nullptr;
     double* d_residual = nullptr;
     double* d_temp = nullptr;
-    double* d_dK = nullptr;
+    double* d_rTilde = nullptr;
 };
 
 // This global object remains alive between MATLAB MEX calls and preserves data in the GPU.
-// mgpcg_gpu_mex('init', H); creates the GPU data and later mgpcg_gpu_mex('solve', ...); uses the same data.
 struct SolverContext
 {
     bool initialized = false;
 
     int numLevels = 0;
+    size_t size = 0;
+    double tolerance = 0.0;
+    int maxIterations = 0;
 
-    std::vector<LevelGPU> levels;
+    std::vector<Level> levels;
     std::vector<int> spanWidths;
 
     cublasHandle_t cublasHandle = nullptr;
 
-    /*
-     * Finest-level PCG vectors.
-     */
+    int numFixedDOFs = 0;
+    int32_t* h_fixedDOFIds = nullptr;
+
+    int numCoarseFreeDOFs = 0;
+    int32_t* h_coarseFreeDOFIds = nullptr;
+
+    double* h_Ke = nullptr;
+    double* d_Ke = nullptr;
+
+    int32_t* h_fixedDOFIds = nullptr;
+    int32_t* h_coarseFreeDOFIds = nullptr;
+
+    int32_t* d_fixedDOFIds = nullptr;
+    int32_t* d_coarseFreeDOFIds = nullptr;
+
+    void* d_workspace = nullptr;
+
+    double* h_b = nullptr;
     double* d_b = nullptr;
+
+    double* h_y = nullptr;
     double* d_y = nullptr;
+
     double* d_r = nullptr;
     double* d_z = nullptr;
     double* d_p = nullptr;
@@ -104,7 +130,51 @@ __global__ void zeroSelectedDOFsKernel(
 
     vector[dof] = 0.0;
 }
+__global__ void dampedJacobiSmootherKernelFine(
+    const double* __restrict__ r,
+    const double* __restrict__ diagK,
+    double * __restrict__ x,
+    double* __restrict__ rTilde,
+    const double weightFactorJacobi,
+    const int numDOFs)
+{
+    // Calculate the global thread index
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
+    // Ensure we don't read or write out of bounds
+    if (idx < numDOFs) {
+        // rTilde = weightFactorJacobi * r ./ diagK
+        x[idx] = weightFactorJacobi * (r[idx] / diagK[idx]);
+    }
+    rTilde = x;
+}
+__global__ void dampedJacobiSmootherKernelCoarse(
+    const double* __restrict__ r,
+    const double* __restrict__ diagK,
+    double* __restrict__ x,
+    const double weightFactorJacobi,
+    const int numDOFs)
+{
+    // Calculate the global thread index
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Ensure we don't read or write out of bounds
+    if (idx < numDOFs) {
+        // rTilde = weightFactorJacobi * r ./ diagK
+        x[idx] = weightFactorJacobi * (r[idx] / diagK[idx]);
+    }
+}
+__global__ void addVectorsInPlaceKernel(
+    double* __restrict__ a,
+    const double* __restrict__ b,
+    int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < n) {
+        a[i] += b[i];
+    }
+}
 __global__ void kbyu_kernel(
     const double* __restrict__ U,               // [3*numNodes]
     double* __restrict__ Y,                     // [3*numNodes]
@@ -578,6 +648,814 @@ static void zeroFixedDOFs(
 
     CUDA_CHECK(cudaGetLastError());
 }
+//TODO---->Will this need to be updated? And contain later added fields? Or is it just for the static hierarchy arrays?
+static size_t calculateRequiredGPUBytes(
+    const SolverContext& solver)
+{
+    size_t bytes = 0;
+
+    for (int levelIndex = 0;
+         levelIndex < solver.numLevels;
+         ++levelIndex)
+    {
+        const Level& level =
+            solver.levels[levelIndex];
+
+        // Static integer hierarchy arrays.
+        bytes +=
+            static_cast<size_t>(level.numNodes) *
+            8 *
+            sizeof(int32_t);
+
+        bytes +=
+            static_cast<size_t>(level.numElements) *
+            8 *
+            sizeof(int32_t);
+
+        bytes +=
+            static_cast<size_t>(level.numNodes) *
+            sizeof(int32_t);
+
+        bytes +=
+            level.numGridNodes *
+            sizeof(int32_t);
+
+        // eleModulus exists on the finest level.
+        if (levelIndex == 0)
+        {
+            bytes +=
+                static_cast<size_t>(level.numElements) *
+                sizeof(double);
+        }
+
+        // dK exists on every level except the coarsest,
+        // based on your current intended layout.
+        if (levelIndex < solver.numLevels - 1)
+        {
+            bytes +=
+                static_cast<size_t>(level.numDOFs) *
+                sizeof(double);
+        }
+
+        // rhs, x, residual and temp.
+        bytes +=
+            4 *
+            static_cast<size_t>(level.numDOFs) *
+            sizeof(double);
+    }
+
+    bytes +=
+        static_cast<size_t>(solver.numFixedDOFs) *
+        sizeof(int32_t);
+
+    bytes +=
+        static_cast<size_t>(
+            solver.numCoarseFreeDOFs) *
+        sizeof(int32_t);
+
+    if (!solver.levels.empty())
+    {
+        const size_t finestDOFs =
+            static_cast<size_t>(
+                solver.levels[0].numDOFs);
+
+        // b, y, r, z, p and Ap.
+        bytes +=
+            6 *
+            finestDOFs *
+            sizeof(double);
+    }
+
+    return bytes;
+}
+static void initializeGPUHierarchy(
+    SolverContext& solver,
+    const mxArray* hierarchyMx,
+    const mxArray* bMx,
+    const mxArray* yMx,
+    double tolerance,
+    int maxIterations)
+{
+    if (hierarchyMx == nullptr ||!mxIsStruct(hierarchyMx) || mxGetNumberOfElements(hierarchyMx) != 1)
+    {
+        mexErrMsgIdAndTxt("mgpcg_gpu:hierarchy","H must be a scalar MATLAB struct.");
+    };
+
+    // get the number of levels in the hierarchy
+    mxArray *numLevelsField = mxGetField(hierarchyMx, 0, "numLevels");
+    int32_t numLevels = (int32_t)mxGetScalar(numLevelsField);
+    // Retrieve the resX, resY, resZ, numNodes, numElements, numDOFs, spanWidth, vecB, vecY fields from the hierarchy struct
+    
+    mxArray *resXField = mxGetField(hierarchyMx, 0, "resX");
+    int32_t *resX = static_cast<int32_t*>(mxGetData(resXField));
+
+    mxArray *resYField = mxGetField(hierarchyMx, 0, "resY");
+    int32_t *resY = static_cast<int32_t*>(mxGetData(resYField));
+
+    mxArray *resZField = mxGetField(hierarchyMx, 0, "resZ");
+    int32_t *resZ = static_cast<int32_t*>(mxGetData(resZField));
+
+    mxArray *numNodesField = mxGetField(hierarchyMx, 0, "numNodes");
+    int32_t *numNodes = static_cast<int32_t*>(mxGetData(numNodesField));
+
+    mxArray *numElementsField = mxGetField(hierarchyMx, 0, "numElements");
+    int32_t *numElements = static_cast<int32_t*>(mxGetData(numElementsField));
+
+    mxArray *numDOFsField = mxGetField(hierarchyMx, 0, "numDOFs");
+    int32_t *numDOFs = static_cast<int32_t*>(mxGetData(numDOFsField));
+
+    mxArray *spanWidthField = mxGetField(hierarchyMx, 0, "spanWidth");
+    int32_t *spanWidth = static_cast<int32_t*>(mxGetData(spanWidthField));
+
+    mxArray *vecBField = mxGetField(hierarchyMx, 0, "vecB");
+    double *vecB = static_cast<double*>(mxGetData(vecBField));
+
+    mxArray *vecYField = mxGetField(hierarchyMx, 0, "vecY");
+    double *vecY = static_cast<double*>(mxGetData(vecYField));
+
+    // Retrieve the nodeToElements, eNodMat, nodGridId, nodMapForward, eleModulus, diagK fields from the hierarchy struct
+    mxArray *nodeToElementsField = mxGetField(hierarchyMx, 0, "nodeToElements");
+    mxArray *eNodMatField = mxGetField(hierarchyMx, 0, "eNodMat");
+    mxArray *nodGridIdField = mxGetField(hierarchyMx, 0, "nodGridId");
+    mxArray *nodMapForwardField = mxGetField(hierarchyMx, 0, "nodMapForward");
+    mxArray *eleModulusField = mxGetField(hierarchyMx, 0, "eleModulus");
+    mxArray *diagKField = mxGetField(hierarchyMx, 0, "diagK");
+
+    solver.initialized = false;
+    solver.numLevels = numLevels;
+
+    solver.levels.clear();
+    solver.levels.resize(numLevels);
+
+    solver.spanWidths.clear();
+
+    solver.tolerance = tolerance;
+    solver.maxIterations = maxIterations;
+
+    solver.h_b = vecB;
+    solver.h_y = vecY;
+
+    if (numLevels > 1)
+        solver.spanWidths.resize(numLevels - 1);
+
+    size_t staticHierarchyBytes = 0;
+    size_t multigridWorkspaceBytes = 0;
+    size_t finestPCGWorkspaceBytes = 0;
+
+    for (int level = 0; level < numLevels; ++level)
+    {
+
+        Level& hlevel = solver.levels[level];
+
+        hlevel.nx = static_cast<int32_t>(resX[level]);
+        hlevel.ny = static_cast<int32_t>(resY[level]);
+        hlevel.nz = static_cast<int32_t>(resZ[level]);
+        hlevel.numNodes = static_cast<int32_t>(numNodes[level]);
+        hlevel.numElements = static_cast<int32_t>(numElements[level]);
+        hlevel.numDOFs = static_cast<int32_t>(numDOFs[level]);
+        hlevel.numGridNodes =
+            static_cast<size_t>(hlevel.nx + 1) *
+            static_cast<size_t>(hlevel.ny + 1) *
+            static_cast<size_t>(hlevel.nz + 1);
+
+        /*
+         * Explicitly keep all GPU pointers null.
+         */
+        hlevel.h_nodeToElements = static_cast<const int32_t*>(mxGetData((mxGetCell(nodeToElementsField, level))));
+        hlevel.h_eNodMat = static_cast<const int32_t*>(mxGetData((mxGetCell(eNodMatField, level))));
+        hlevel.h_nodGridId = static_cast<const int32_t*>(mxGetData((mxGetCell(nodGridIdField, level))));
+        hlevel.h_nodMapForward = static_cast<const int32_t*>(mxGetData((mxGetCell(nodMapForwardField, level))));
+
+        if (level < numLevels - 1)
+        {
+            hlevel.h_dK = static_cast<const double*>(mxGetData((mxGetCell(diagKField, level))));
+        }
+        else{
+            hlevel.h_dK = nullptr;
+        }
+
+        if (level == 0){
+            hlevel.h_eleModulus = static_cast<const double*>(mxGetData((mxGetCell(eleModulusField, level))));
+        }
+        else{
+            hlevel.h_eleModulus = nullptr;
+        }
+
+        // TODO. Check whether we are using the numFixed etc
+        if(level == 0){
+            mxArray* fixedDOFIdsMx = mxGetField(hierarchyMx, 0, "fixedDOFIds");
+            solver.h_fixedDOFIds = static_cast<const int32_t*>(mxGetData(fixedDOFIdsMx));
+            solver.numFixedDOFs = static_cast<int>(mxGetNumberOfElements(fixedDOFIdsMx));
+            solver.h_Ke = static_cast<const double*>(mxGetData(mxGetField(hierarchyMx, 0, "Ke")));
+
+        }else if(level == numLevels - 1){
+            mxArray* coarseFreeDOFIdsMx = mxGetField(hierarchyMx, 0, "coarseFreeDOFIds");
+            solver.h_coarseFreeDOFIds = static_cast<const int32_t*>(mxGetData(coarseFreeDOFIdsMx));
+            solver.numCoarseFreeDOFs = static_cast<int>(mxGetNumberOfElements(coarseFreeDOFIdsMx));
+        }
+    
+        // add spanwidth
+        if(level < numLevels - 2){
+            solver.spanWidths[level] = static_cast<int32_t>(spanWidth[level]);
+        }
+
+        hlevel.d_rhs = nullptr;
+        hlevel.d_x = nullptr;
+        hlevel.d_residual = nullptr;
+        hlevel.d_temp = nullptr;
+    }
+    solver.size = calculateRequiredGPUBytes(solver);
+}
+
+/*
+static void initializeGPU(
+    SolverContext& solver)
+{       
+        // Initialze GPU
+        cudaDeviceReset();
+        cudaSetDevice(0);
+        cudaFree(0);
+        size_t f, t;
+        cudaMemGetInfo(&f, &t);
+        //TODO.ADD--->CUDA_CHECK(cudaMemcpyToSymbol( Ae, Ae0, sizeof(double) * 24*24) );
+        // Get the overall size of the SolverContext
+        double size = solver.size;
+        // Report also the GPU Memory, check whether it fits
+        if (size>f)
+            MEX_PRINT("\nMGCG - Cuda device has not %d free memory, %d is required.\n", f, size);
+            plhs[0] = mxCreateDoubleScalar(0.0);
+            plhs[1] = mxCreateDoubleScalar(-1.0);
+        }
+        else {
+        // Allocate Memory In The GPU
+        double *devW;
+        CUDA_CHECK(cudaMalloc( (void**)&devW, size) );
+        // Map the pointers to the Allocated Memory
+        for (int level = 0; level < solver.numLevels; ++level)
+        {
+            
+        }      
+}
+        
+*/
+
+static void initializeGPU(
+    SolverContext& solver)
+{
+    CUDA_CHECK(cudaSetDevice(0));
+    CUDA_CHECK(cudaFree(0));
+
+    size_t freeMemory;
+    size_t totalMemory;
+
+    CUDA_CHECK(cudaMemGetInfo(&freeMemory, &totalMemory));
+
+    if (solver.size > freeMemory)
+    {
+        mexErrMsgIdAndTxt("mgpcg_gpu:memory", "\nMGCG - Cuda device does not have %zu free memory, %zu is required.\n", freeMemory, solver.size);
+    }
+
+    CUDA_CHECK(cudaMalloc(&solver.d_workspace, solver.size));
+
+    // Casting void* to char* lets us move through the allocated memory one byte at a time.
+    char* dW = static_cast<char*>(solver.d_workspace);
+
+    size_t offset = 0;
+
+    // Adding doubles first to ensure proper alignment for double arrays
+    solver.levels[0].d_eleModulus= reinterpret_cast<double*>(dW + offset);
+    offset += static_cast<size_t>(solver.levels[0].numElements) * sizeof(double);
+
+    solver.levels[solver.numLevels - 1].d_dK = reinterpret_cast<double*>(dW + offset);
+    offset += static_cast<size_t>(solver.levels[solver.numLevels - 1].numDOFs) * sizeof(double);
+
+    const size_t finestDOFs = static_cast<size_t>(solver.levels[0].numDOFs);
+    solver.d_b = reinterpret_cast<double*>(dW + offset);
+    offset += finestDOFs * sizeof(double);
+
+    solver.d_y = reinterpret_cast<double*>(dW + offset);
+    offset += finestDOFs * sizeof(double);
+
+    solver.d_r = reinterpret_cast<double*>(dW + offset);
+    offset += finestDOFs * sizeof(double);
+
+    solver.d_z = reinterpret_cast<double*>(dW + offset);
+    offset += finestDOFs * sizeof(double);
+
+    solver.d_p = reinterpret_cast<double*>(dW + offset);
+    offset += finestDOFs * sizeof(double);
+
+    solver.d_Ap = reinterpret_cast<double*>(dW + offset);
+    offset += finestDOFs * sizeof(double);
+
+    solver.levels[0].d_rTilde = reinterpret_cast<double*>(dW + offset);
+    offset += static_cast<size_t>(solver.levels[0].numDOFs) * sizeof(double);
+
+    for (int levelIndex = 0;levelIndex < solver.numLevels; ++levelIndex)
+    {
+        Level& level = solver.levels[levelIndex];
+        level.d_rhs = reinterpret_cast<double*>(dW + offset);
+        offset += static_cast<size_t>(level.numDOFs) * sizeof(double);
+
+        level.d_x = reinterpret_cast<double*>(dW + offset);
+        offset +=static_cast<size_t>(level.numDOFs) * sizeof(double);
+
+        level.d_residual = reinterpret_cast<double*>(dW + offset);
+        offset += static_cast<size_t>(level.numDOFs) * sizeof(double);
+
+        level.d_temp = reinterpret_cast<double*>(dW + offset);
+        offset += static_cast<size_t>(level.numDOFs) * sizeof(double);
+
+    }
+
+    for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
+    {
+        Level& level = solver.levels[levelIndex];
+
+        level.d_nodeToElements = reinterpret_cast<int32_t*>(dW + offset);
+        offset += static_cast<size_t>(level.numNodes) * 8 * sizeof(int32_t);
+
+        level.d_eNodMat = reinterpret_cast<int32_t*>(dW + offset);
+        offset += static_cast<size_t>(level.numElements) * 8 * sizeof(int32_t);
+
+        level.d_nodGridId = reinterpret_cast<int32_t*>(dW + offset);
+        offset += static_cast<size_t>(level.numNodes) * sizeof(int32_t);
+
+        level.d_nodMapForward = reinterpret_cast<int32_t*>(dW + offset);
+        offset += level.numGridNodes * sizeof(int32_t);
+    }
+    // Also add numdofS, jacobiOmega
+    solver.d_fixedDOFIds = reinterpret_cast<int32_t*>(dW + offset);
+    offset += static_cast<size_t>(solver.numFixedDOFs) * sizeof(int32_t);
+
+    solver.d_coarseFreeDOFIds = reinterpret_cast<int32_t*>(dW + offset);
+    offset += static_cast<size_t>(solver.numCoarseFreeDOFs) * sizeof(int32_t);
+
+
+    // -------------------------------------------------------------------------
+    // Copy static hierarchy data to the GPU.
+    // -------------------------------------------------------------------------
+
+    for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
+    {
+        Level& level = solver.levels[levelIndex];
+
+        CUDA_CHECK(cudaMemcpy(
+            level.d_nodeToElements,
+            level.h_nodeToElements,
+            static_cast<size_t>(level.numNodes) *
+                8 * sizeof(int32_t),
+            cudaMemcpyHostToDevice));
+
+        CUDA_CHECK(cudaMemcpy(
+            level.d_eNodMat,
+            level.h_eNodMat,
+            static_cast<size_t>(level.numElements) *
+                8 * sizeof(int32_t),
+            cudaMemcpyHostToDevice));
+
+        CUDA_CHECK(cudaMemcpy(
+            level.d_nodGridId,
+            level.h_nodGridId,
+            static_cast<size_t>(level.numNodes) *
+                sizeof(int32_t),
+            cudaMemcpyHostToDevice));
+
+        CUDA_CHECK(cudaMemcpy(
+            level.d_nodMapForward,
+            level.h_nodMapForward,
+            level.numGridNodes *
+                sizeof(int32_t),
+            cudaMemcpyHostToDevice));
+
+        if (levelIndex == 0)
+        {
+            CUDA_CHECK(cudaMemcpy(
+                level.d_eleModulus,
+                level.h_eleModulus,
+                static_cast<size_t>(level.numElements) *
+                    sizeof(double),
+                cudaMemcpyHostToDevice));
+        }
+
+        if (levelIndex < solver.numLevels - 1)
+        {
+            CUDA_CHECK(cudaMemcpy(
+                level.d_dK,
+                level.h_dK,
+                static_cast<size_t>(level.numDOFs) *
+                    sizeof(double),
+                cudaMemcpyHostToDevice));
+        }
+
+        CUDA_CHECK(cudaMemset(
+            level.d_rhs,
+            0,
+            static_cast<size_t>(level.numDOFs) *
+                sizeof(double)));
+
+        CUDA_CHECK(cudaMemset(
+            level.d_x,
+            0,
+            static_cast<size_t>(level.numDOFs) *
+                sizeof(double)));
+
+        CUDA_CHECK(cudaMemset(
+            level.d_residual,
+            0,
+            static_cast<size_t>(level.numDOFs) *
+                sizeof(double)));
+
+        CUDA_CHECK(cudaMemset(
+            level.d_temp,
+            0,
+            static_cast<size_t>(level.numDOFs) *
+                sizeof(double)));
+    }
+
+    CUDA_CHECK(cudaMemcpy(
+        solver.d_fixedDOFIds,
+        solver.h_fixedDOFIds,
+        static_cast<size_t>(solver.numFixedDOFs) *
+            sizeof(int32_t),
+        cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemcpy(
+        solver.d_coarseFreeDOFIds,
+        solver.h_coarseFreeDOFIds,
+        static_cast<size_t>(solver.numCoarseFreeDOFs) *
+            sizeof(int32_t),
+        cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemset(
+        solver.d_b,
+        solver.h_b,
+        finestDOFs * sizeof(double)));
+
+    CUDA_CHECK(cudaMemset(
+        solver.d_y,
+        solver.h_y,
+        finestDOFs * sizeof(double)));
+
+    CUDA_CHECK(cudaMemset(
+        solver.d_r,
+        0,
+        finestDOFs * sizeof(double)));
+
+    CUDA_CHECK(cudaMemset(
+        solver.d_z,
+        0,
+        finestDOFs * sizeof(double)));
+
+    CUDA_CHECK(cudaMemset(
+        solver.d_p,
+        0,
+        finestDOFs * sizeof(double)));
+
+    CUDA_CHECK(cudaMemset(
+        solver.d_Ap,
+        0,
+        finestDOFs * sizeof(double)));
+
+    CUDA_CHECK(cudaMemcpyToSymbol(
+        c_Ke,
+        solver.h_Ke,
+        24 * 24 * sizeof(double)));
+
+    if (cublasCreate(&solver.cublasHandle) != CUBLAS_STATUS_SUCCESS)
+    {
+        mexErrMsgIdAndTxt(
+            "mgpcg_gpu:cublas",
+            "Could not create the cuBLAS handle.");
+    }
+
+    solver.initialized = true;
+}
+
+void destroySolver(
+    SolverContext& solver)
+{
+    if (solver.initialized)
+    {
+        CUDA_CHECK(cudaFree(solver.d_workspace));
+        solver.d_workspace = nullptr;
+
+        if (solver.cublasHandle != nullptr)
+        {
+            cublasDestroy(solver.cublasHandle);
+            solver.cublasHandle = nullptr;
+        }
+
+        solver.initialized = false;
+    }
+}
+/*
+static void applyVcycle(
+    SolverContext& solver,
+    const double* d_fineResidual,
+    double* d_fineCorrection)
+{
+    const int lastLevel = solver.numLevels - 1;
+
+    constexpr int blockSize = 256;
+
+    // Store the finest RHS in the already allocated level workspace.
+    CUDA_CHECK(cudaMemcpy(solver.levels[0].d_rhs,d_fineResidual, static_cast<size_t>(solver.levels[0].numDOFs) * sizeof(double), cudaMemcpyDeviceToDevice));
+
+    // Start every level correction from zero.
+    // TODO: Add this to initializeGPU to avoid this extra kernel launch.
+    for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
+    {
+        Level& level = solver.levels[levelIndex];
+        CUDA_CHECK(cudaMemset(level.d_x, 0,static_cast<size_t>(level.numDOFs) * sizeof(double)));
+    }
+
+    // Fine -> coarse:
+    // x_l = omega * r_l ./ diagK_l
+    // r_(l+1) = R_l * r_l
+    for (int levelIndex = 1;levelIndex <= lastLevel;++levelIndex)
+    {
+        Level& level = solver.levels[levelIndex];
+        Level& fineLevel = solver.levels[levelIndex - 1];
+
+        // TODO. Check thread sizes etc
+        if (levelIndex == 1){
+            dampedJacobiSmootherKernelFine<<<level.numDOFs, blockSize, blockSize>>>(
+                fineLevel.d_rhs,
+                fineLevel.d_dK,
+                fineLevel.d_residual,
+                fineLevel.d_rTilde,
+                solver.jacobiOmega,
+                fineLevel.numDOFs);
+             
+            restrictResidualKernel<<<level.numDOFs, blockSize, blockSize>>>(
+                level.d_nodGridId,
+                fineLevel.d_nodMapForward,
+                fineLevel.d_residual,
+                level.d_rhs,
+                level.numNodes,
+                level.nx,
+                level.ny,
+                level.nz,
+                solver.spanWidths[levelIndex]);
+        }else{
+            dampedJacobiSmootherKernelCoarse<<<level.numDOFs, blockSize, blockSize>>>(
+                level.d_rhs,
+                level.d_dK,
+                level.d_x,
+                solver.jacobiOmega,
+                level.numDOFs);
+                
+            restrictResidualKernel<<<level.numDOFs, blockSize, blockSize>>>(
+                level.d_nodGridId,
+                fineLevel.d_nodMapForward,
+                fineLevel.d_residual,
+                level.d_rhs,
+                level.numNodes,
+                level.nx,
+                level.ny,
+                level.nz,
+                solver.spanWidths[levelIndex]);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // Implement this with cuDDS
+    solveCoarsest(
+        solver,
+        solver.levels[lastLevel].d_rhs,
+        solver.levels[lastLevel].d_x);
+
+    // Coarse -> fine:
+    // x_l += P_l * x_(l+1)
+    // x_l += omega * r_l ./ diagK_l
+    for (int levelIndex = lastLevel - 1; levelIndex >= 0; --levelIndex)
+    {
+        Level& level = solver.levels[levelIndex];
+        Level& finelevel = solver.levels[levelIndex - 1];
+
+        if(fineLevelIndex == 1){
+            double* d_rTilde = finelevel.d_rTilde;
+            interpolateResidualKernel<<<level.numDOFs, blockSize, blockSize>>>(
+                level.d_nodGridId,
+                level.d_nodMapForward,
+                level.d_x,
+                level.d_residual,
+                level.numNodes,
+                level.nx,
+                level.ny,
+                level.nz,
+                solver.spanWidths[fineLevelIndex]);
+            // Element wise addition of d_residual and d_rTilde
+            addVectorsInPlaceKernel<<<level.numDOFs, blockSize, blockSize>>>(
+                level.d_residual,
+                d_rTilde,
+                level.numDOFs);
+            
+            // Apply the damped Jacobi smoother on the fine level
+            dampedJacobiSmootherKernelFine<<<level.numDOFs, blockSize, blockSize>>>(
+                fineLevel.d_rhs,
+                fineLevel.d_dK,
+                fineLevel.d_residual,
+                fineLevel.d_rTilde,
+                solver.jacobiOmega,
+                fineLevel.numDOFs);
+            double rTilde2 = finelevel.d_rTilde;
+            // Element wise addition of d_rTilde and d_rTilde2
+            addVectorsInPlaceKernel<<<level.numDOFs, blockSize, blockSize>>>(
+                rTilde2,
+                d_rTilde,
+                level.numDOFs);
+        }else{
+            interpolateResidualKernel<<<level.numDOFs, blockSize, blockSize>>>(
+                finelevel.d_nodGridId,
+                level.d_nodMapForward,
+                level.d_x,
+                finelevel.d_x,
+                finelevel.numNodes,
+                level.nx,
+                level.ny,
+                level.nz,
+                solver.spanWidths[fineLevelIndex]);
+            addVectorsInPlaceKernel<<<level.numDOFs, blockSize, blockSize>>>(
+                level.d_x,
+                finelevel.d_x,
+                finelevel.numDOFs);
+            double xTemp = finelevel.d_temp;
+            // Apply the damped Jacobi smoother on the fine level
+            dampedJacobiSmootherKernelCoarse<<<level.numDOFs, blockSize, blockSize>>>(
+                fineLevel.d_rhs,
+                fineLevel.d_dK,
+                fineLevel.d_x,
+                solver.jacobiOmega,
+                fineLevel.numDOFs);
+            addVectorsInPlaceKernel<<<level.numDOFs, blockSize, blockSize>>>(
+                xTemp,
+                finelevel.d_x,
+                finelevel.numDOFs);
+        }
+
+    }
+
+    // Zero out the fixed DOFs in the correction vector.
+    zeroSelectedDOFsKernel<<<(solver.numFixedDOFs + blockSize - 1) / blockSize, blockSize>>>(
+        solver.levels[0].d_x,
+        solver.d_fixedDOFIds,
+        solver.numFixedDOFs);
+
+    CUDA_CHECK(cudaMemcpy(
+        d_fineCorrection,
+        solver.levels[0].d_x,
+        static_cast<size_t>(solver.levels[0].numDOFs) *
+            sizeof(double),
+        cudaMemcpyDeviceToDevice));
+}
+        */
+static void applyVcycle(
+    SolverContext& solver,
+    const double* d_fineResidual,
+    double* d_fineCorrection)
+{
+    constexpr int blockSize = 256;
+
+    const int lastLevel = solver.numLevels - 1;
+
+    Level& finest = solver.levels[0];
+
+    // MATLAB input r.
+    CUDA_CHECK(cudaMemcpy(finest.d_rhs, d_fineResidual, static_cast<size_t>(finest.numDOFs) * sizeof(double), cudaMemcpyDeviceToDevice));
+
+    // Reset x and temporary vectors.
+    for (Level& level : solver.levels)
+    {
+        CUDA_CHECK(cudaMemset(level.d_x,0,static_cast<size_t>(level.numDOFs) * sizeof(double)));
+        CUDA_CHECK(cudaMemset(level.d_temp,0,static_cast<size_t>(level.numDOFs) * sizeof(double)));
+    }
+
+    /*
+     * Fine -> coarse.
+     */
+    for (int fineIndex = 0; fineIndex < lastLevel; ++fineIndex)
+    {
+        Level& fine = solver.levels[fineIndex];
+
+        Level& coarse = solver.levels[fineIndex + 1];
+
+        const int fineDOFBlocks = (fine.numDOFs + blockSize - 1) / blockSize;
+
+        dampedJacobiSmootherKernelCoarse
+            <<<fineDOFBlocks, blockSize>>>(
+                fine.d_rhs,
+                fine.d_dK,
+                fine.d_x,
+                solver.jacobiOmega,
+                fine.numDOFs);
+
+        CUDA_CHECK(cudaGetLastError());
+
+        const int coarseNodeBlocks = (coarse.numNodes + blockSize - 1) / blockSize;
+
+        restrictResidualKernel
+            <<<coarseNodeBlocks, blockSize>>>(
+                coarse.d_nodGridId,
+                fine.d_nodMapForward,
+                fine.d_rhs,
+                coarse.d_rhs,
+                coarse.numNodes,
+                coarse.nx,
+                coarse.ny,
+                coarse.nz,
+                fine.nx,
+                fine.ny,
+                fine.nz,
+                solver.spanWidths[fineIndex]);
+
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    /*
+     * Direct coarse solve.
+     */
+    solveCoarsest(
+        solver,
+        solver.levels[lastLevel].d_rhs,
+        solver.levels[lastLevel].d_x);
+
+    /*
+     * Coarse -> fine.
+     */
+    for (int fineIndex = lastLevel - 1; fineIndex >= 0; --fineIndex)
+    {
+        Level& fine = solver.levels[fineIndex];
+
+        Level& coarse = solver.levels[fineIndex + 1];
+
+        const int fineNodeBlocks = (fine.numNodes + blockSize - 1) / blockSize;
+
+        interpolateResidualKernel
+            <<<fineNodeBlocks, blockSize>>>(
+                fine.d_nodGridId,
+                coarse.d_nodMapForward,
+                coarse.d_x,
+                fine.d_temp,
+                fine.numNodes,
+                coarse.nx,
+                coarse.ny,
+                coarse.nz,
+                fine.nx,
+                fine.ny,
+                fine.nz,
+                solver.spanWidths[fineIndex]);
+
+        CUDA_CHECK(cudaGetLastError());
+
+        const int fineDOFBlocks = (fine.numDOFs + blockSize - 1) / blockSize;
+
+        addVectorsInPlaceKernel
+            <<<fineDOFBlocks, blockSize>>>(
+                fine.d_x,
+                fine.d_temp,
+                fine.numDOFs);
+
+        CUDA_CHECK(cudaGetLastError());
+
+        // Reuse temp for the post-smoothing term.
+        dampedJacobiSmootherKernelCoarse
+            <<<fineDOFBlocks, blockSize>>>(
+                fine.d_rhs,
+                fine.d_dK,
+                fine.d_temp,
+                solver.jacobiOmega,
+                fine.numDOFs);
+
+        CUDA_CHECK(cudaGetLastError());
+
+        addVectorsInPlaceKernel
+            <<<fineDOFBlocks, blockSize>>>(
+                fine.d_x,
+                fine.d_temp,
+                fine.numDOFs);
+
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    zeroFixedDOFs(solver, finest.d_x);
+
+    CUDA_CHECK(cudaMemcpy(d_fineCorrection, finest.d_x, static_cast<size_t>(finest.numDOFs) * sizeof(double), cudaMemcpyDeviceToDevice));
+}
+void runMGPCG(
+    SolverContext* solver)
+{
+
+    // Everthing is already on the GPU, so to this function implement the MGPCG algorithm on the GPU.
+
+    // Initialize the residual r = b - A*y
+    
+
+
+
+}
+
 void mexFunction(
     int nlhs,
     mxArray* plhs[],
@@ -587,7 +1465,7 @@ void mexFunction(
     if (nrhs != 5) {
         mexErrMsgIdAndTxt(
             "mgpcg_gpu:nrhs",
-            "Usage: [y,it,res] = Solving_MGPCG_GPU("
+            "Wrong Number of Arguments for Solving_MGPCG_GPU. It should be("
             "b, tolerance, maxIterations, y0, H)");
     }
 
@@ -597,38 +1475,36 @@ void mexFunction(
             "The function supports one to three outputs.");
     }
 
-    const mxArray* bMx =
-        prhs[0];
-
-    const double tolerance =
-        mxGetScalar(prhs[1]);
-
-    const int maxIterations =
-        static_cast<int>(
-            mxGetScalar(prhs[2]));
-
-    const mxArray* y0Mx =
-        prhs[3];
-
-    const mxArray* hierarchyMx =
-        prhs[4];
+    const mxArray* bMx = prhs[0];
+    const double tolerance = mxGetScalar(prhs[1]);
+    const int maxIterations = static_cast<int>(mxGetScalar(prhs[2]));
+    const mxArray* y0Mx = prhs[3];
+    const mxArray* hierarchyMx = prhs[4];
 
     SolverContext solver;
 
     try {
+        // Unpack hierarchyMx to SolverContext
         initializeGPUHierarchy(
-            solver,
-            hierarchyMx);
-
-        allocateSolverWorkspace(
-            solver);
-
-        runMGPCG(
-            solver,
+            &solver,
+            hierarchyMx,
             bMx,
             y0Mx,
             tolerance,
-            maxIterations);
+            maxIterations
+        );
+        // Get the overall size of the SolverContext
+        // Report also the GPU Memory, check whether it fits
+        // Allocate Memory In The GPU
+        // Map the pointers to the Allocated Memory
+        
+        // 
+        initializeGPU(
+            &solver, 
+        );
+
+        runMGPCG(
+            &solver);
 
         createMATLABOutputs(
             solver,

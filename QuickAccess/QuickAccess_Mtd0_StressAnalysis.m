@@ -34,6 +34,8 @@ disp(['Assemble Computing Stencil Costs: ', sprintf('%10.3g',toc(tStart)) 's']);
 
 %% 4. Solving FEA Linear System via Conjugate Gradien Method
 tStart = tic;
+%% If there is no Y, create and pass an zerosY
+H_ = Build_GPU_Hierarchy(meshHierarchy_);
 U_ = Solving_PreconditionedConjugateGradientSolver(@Solving_KbyU_MatrixFree, @Solving_Vcycle, F_, tol_, maxIT_, 'printP_ON');
 disp(['Liner System Solver Costs: ', sprintf('%10.3g',toc(tStart)) 's']);
 

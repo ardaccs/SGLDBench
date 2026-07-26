@@ -8,6 +8,7 @@
     Language="CUDA"
     Priority="X"
     Location="$CUDA_ROOT\bin\nvcc.exe" >
+
     <Details
         CompilerExecutable="$COMPILER"
         CompilerDefines="$COMPDEFINES"
@@ -25,36 +26,46 @@
         CompilerDefineFormatter="--compiler-options=/D%s"
         LinkerLibrarySwitchFormatter="lib%s.lib;%s.lib"
         LinkerPathFormatter="/LIBPATH:%s"
-        LibrarySearchPath="$$LIB;$$LIBPATH;$$PATH;$$INCLUDE;$MATLABROOT\extern\lib\$ARCH\microsoft"
+        LibrarySearchPath="$$LIB;$$LIBPATH;$$PATH;$$INCLUDE;$CUDSS_LIB_PATH;$MATLABROOT\extern\lib\$ARCH\microsoft"
     />
+
     <vars
         CMDLINE100="$COMPILER -c $COMPFLAGS $OPTIM $COMPDEFINES $INCLUDE $SRC -o $OBJ &amp;&amp; echo /Fo &gt; NUL"
         CMDLINE200="$LINKER $LINKFLAGS $LINKTYPE $LINKOPTIM $LINKEXPORTVER $OBJS $LINKLIBS /out:$EXE"
         CMDLINE250="mt -outputresource:$EXE;2 -manifest $MANIFEST"
         CMDLINE300="del $EXP $LIB $MANIFEST $ILK"
-        
+
         COMPILER="&quot;$CUDA_ROOT\bin\nvcc.exe&quot; -ccbin &quot;$VCINSTALLDIR\bin\HostX64\x64&quot;"
         COMPFLAGS="--compiler-options=/Zp8,/GR,/W3,/EHs,/nologo,/MD $NVCCFLAGS $NVVMIR_LIBRARY"
+
         NVCCFLAGS="-gencode=arch=compute_50,code=sm_50 -gencode=arch=compute_60,code=sm_60 -gencode=arch=compute_70,code=sm_70 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_90,code=&#92;&quot;sm_90,compute_90&#92;&quot;"
+
         COMPDEFINES="--compiler-options=/D_CRT_SECURE_NO_DEPRECATE,/D_SCL_SECURE_NO_DEPRECATE,/D_SECURE_SCL=0,$MATLABMEX"
         MATLABMEX="/DMATLAB_MEX_FILE"
+
         OPTIMFLAGS="--compiler-options=/O2,/Oy-,/DNDEBUG"
-        INCLUDE="-I&quot;$MATLABROOT\extern\include&quot; -I&quot;$MATLABROOT\simulink\include&quot; -I&quot;$CUDA_ROOT\include&quot;"
+
+        INCLUDE="-I&quot;$MATLABROOT\extern\include&quot; -I&quot;$MATLABROOT\simulink\include&quot; -I&quot;$CUDA_ROOT\include&quot; -I&quot;$CUDSS_ROOT\include&quot;"
+
         DEBUGFLAGS="--compiler-options=/Z7"
-        
+
         LINKER="&quot;$VCINSTALLDIR\bin\HostX64\x64\link.exe&quot;"
         LINKFLAGS="/nologo /manifest "
         LINKTYPE="/DLL"
+
         LINKEXPORT="/EXPORT:mexFunction"
         LINKEXPORTVER="/EXPORT:mexFunction /EXPORT:mexfilerequiredapiversion"
-        LINKLIBS="/LIBPATH:&quot;$VCINSTALLDIR\lib\x64&quot; /LIBPATH:&quot;$KITSROOT\Lib\$SDKVERSION\ucrt\x64&quot; /LIBPATH:&quot;$KITSROOT\Lib\$SDKVERSION\um\x64&quot; /LIBPATH:&quot;$CUDA_LIB_PATH&quot; /LIBPATH:&quot;$MATLABROOT\extern\lib\$ARCH\microsoft&quot; libmx.lib libmex.lib libmat.lib libut.lib gpumexbinder.lib cudart.lib kernel32.lib user32.lib gdi32.lib winspool.lib comdlg32.lib advapi32.lib shell32.lib ole32.lib oleaut32.lib uuid.lib odbc32.lib odbccp32.lib libMatlabDataArray.lib libMatlabEngine.lib delayimp.lib /DELAYLOAD:libut.dll"
+
+        LINKLIBS="/LIBPATH:&quot;$VCINSTALLDIR\lib\x64&quot; /LIBPATH:&quot;$KITSROOT\Lib\$SDKVERSION\ucrt\x64&quot; /LIBPATH:&quot;$KITSROOT\Lib\$SDKVERSION\um\x64&quot; /LIBPATH:&quot;$CUDA_LIB_PATH&quot; /LIBPATH:&quot;$CUDSS_LIB_PATH&quot; /LIBPATH:&quot;$MATLABROOT\extern\lib\$ARCH\microsoft&quot; libmx.lib libmex.lib libmat.lib libut.lib gpumexbinder.lib cudart.lib kernel32.lib user32.lib gdi32.lib winspool.lib comdlg32.lib advapi32.lib shell32.lib ole32.lib oleaut32.lib uuid.lib odbc32.lib odbccp32.lib libMatlabDataArray.lib libMatlabEngine.lib delayimp.lib /DELAYLOAD:libut.dll"
+
         NVVMIR_LIBRARY="--dont-use-profile -ldir &quot;$LIBDEVICE&quot;"
-        
+
         LINKDEBUGFLAGS="/debug /PDB:&quot;$TEMPNAME$LDEXT.pdb&quot;"
         LINKOPTIMFLAGS=""
-        
+
         OBJEXT=".obj"
         LDEXT=".mexw64"
+
         SETENV="set COMPILER=$COMPILER
         set COMPFLAGS=/c $COMPFLAGS $COMPDEFINES $MATLABMEX
         set OPTIMFLAGS=$OPTIMFLAGS
@@ -64,23 +75,25 @@
         set LINKDEBUGFLAGS=/debug /PDB:&quot;%OUTDIR%%MEX_NAME%$LDEXT.pdb&quot;
         set NAME_OUTPUT=/out:&quot;%OUTDIR%%MEX_NAME%%MEX_EXT%&quot;"
     />
+
     <locationFinder>
-    <VCROOT>
-        <cmdReturns name="if exist &quot;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat&quot; echo C:\Program Files ^(x86^)\Microsoft Visual Studio\2022\BuildTools" />
-    </VCROOT>
-    
-    <VSINSTALLDIR>
-        <cmdReturns name="if exist &quot;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat&quot; echo C:\Program Files ^(x86^)\Microsoft Visual Studio\2022\BuildTools" />
-    </VSINSTALLDIR>
-    
-    <VCINSTALLDIR>
-        <cmdReturns name="if exist &quot;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.38.33130\bin\HostX64\x64\cl.exe&quot; echo C:\Program Files ^(x86^)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.38.33130" />
-    </VCINSTALLDIR>
-    
-    <VCVARSALLDIR>
-        <cmdReturns name="if exist &quot;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat&quot; echo C:\Program Files ^(x86^)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build" />
-    </VCVARSALLDIR>
-        
+
+        <VCROOT>
+            <cmdReturns name="if exist &quot;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat&quot; echo C:\Program Files ^(x86^)\Microsoft Visual Studio\2022\BuildTools" />
+        </VCROOT>
+
+        <VSINSTALLDIR>
+            <cmdReturns name="if exist &quot;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat&quot; echo C:\Program Files ^(x86^)\Microsoft Visual Studio\2022\BuildTools" />
+        </VSINSTALLDIR>
+
+        <VCINSTALLDIR>
+            <cmdReturns name="if exist &quot;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.38.33130\bin\HostX64\x64\cl.exe&quot; echo C:\Program Files ^(x86^)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.38.33130" />
+        </VCINSTALLDIR>
+
+        <VCVARSALLDIR>
+            <cmdReturns name="if exist &quot;C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat&quot; echo C:\Program Files ^(x86^)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build" />
+        </VCVARSALLDIR>
+
         <SDKROOT>
             <or>
                 <hklmExists path="SOFTWARE\Microsoft\Microsoft SDKs\Windows\v10.0" name="InstallationFolder" />
@@ -89,6 +102,7 @@
                 <hkcuExists path="SOFTWARE\Wow6432Node\Microsoft\Microsoft SDKs\Windows\v10.0" name="InstallationFolder" />
             </or>
         </SDKROOT>
+
         <KITSROOT>
             <or>
                 <hklmExists path="SOFTWARE\Wow6432Node\Microsoft\Windows Kits\Installed Roots" name="KitsRoot10" />
@@ -97,6 +111,7 @@
                 <hkcuExists path="SOFTWARE\Microsoft\Windows Kits\Installed Roots" name="KitsRoot10" />
             </or>
         </KITSROOT>
+
         <SDKVERSION>
             <and>
                 <or>
@@ -105,6 +120,7 @@
                     <hklmExists path="SOFTWARE\Microsoft\Windows Kits\Installed Roots" name="KitsRoot10" />
                     <hkcuExists path="SOFTWARE\Microsoft\Windows Kits\Installed Roots" name="KitsRoot10" />
                 </or>
+
                 <cmdReturns name="echo off&amp;set &quot;sdkversion=&quot;&amp;(for /f %a IN ('dir &quot;$$\include\&quot; /b /ad-h /on') do ( @if exist &quot;$$\include\%a\ucrt\&quot; set &quot;sdkversion=%a&quot; ))&amp;call echo %sdkversion%" />
             </and>
         </SDKVERSION>
@@ -115,23 +131,46 @@
                 <cmdReturns name="echo C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\lib\x64" />
             </or>
         </CUDA_LIB_PATH>
+
         <CUDA_ROOT>
             <or>
                 <cmdReturns name="echo C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" />
                 <cmdReturns name="echo C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3" />
             </or>
         </CUDA_ROOT>
+
         <LIBDEVICE>
             <or>
                 <cmdReturns name="echo C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\nvvm\libdevice" />
                 <cmdReturns name="echo C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\nvvm\libdevice" />
             </or>
         </LIBDEVICE>
+
+        <CUDSS_ROOT>
+            <cmdReturns name="if exist &quot;C:\Program Files\NVIDIA cuDSS\v0.8\include\cudss.h&quot; echo C:\Program Files\NVIDIA cuDSS\v0.8" />
+        </CUDSS_ROOT>
+
+        <CUDSS_LIB_PATH>
+            <cmdReturns name="if exist &quot;C:\Program Files\NVIDIA cuDSS\v0.8\lib\12\cudss.lib&quot; echo C:\Program Files\NVIDIA cuDSS\v0.8\lib\12" />
+        </CUDSS_LIB_PATH>
+
+        <CUDSS_BIN_PATH>
+            <or>
+                <cmdReturns name="if exist &quot;C:\Program Files\NVIDIA cuDSS\v0.8\bin\12&quot; echo C:\Program Files\NVIDIA cuDSS\v0.8\bin\12" />
+                <cmdReturns name="if exist &quot;C:\Program Files\NVIDIA cuDSS\v0.8\bin&quot; echo C:\Program Files\NVIDIA cuDSS\v0.8\bin" />
+            </or>
+        </CUDSS_BIN_PATH>
+
     </locationFinder>
+
     <env
-        PATH="$CUDA_ROOT\nvvm\bin;$CUDA_ROOT\bin;$CUDA_LIB_PATH\..;$CUDA_ROOT;$LIBDEVICE;$VCINSTALLDIR\bin\HostX64\x64\;$VCROOT\Common7\IDE\VC\vcpackages;$VCROOT\Common7\IDE;$VCROOT\Common7\Tools;$SDKROOT\Bin\$SDKVERSION\x64;$SDKROOT\Bin\$SDKVERSION\x86;$SDKROOT\Bin\x64;$SDKROOT\Bin\x86;"
-        INCLUDE="$CUDA_ROOT\include;$VCINSTALLDIR\include;$VCINSTALLDIR\atlmfc\include;$KITSROOT\include\$SDKVERSION\ucrt;$KITSROOT\include\$SDKVERSION\shared;$KITSROOT\include\$SDKVERSION\um;$KITSROOT\include\$SDKVERSION\winrt;$MATLABROOT\extern\include;$MATLABROOT\toolbox\parallel\gpu\extern\include"
-        LIB="$VCINSTALLDIR\lib\x64;$VCINSTALLDIR\atlmfc\lib\x64;$KITSROOT\Lib\$SDKVERSION\ucrt\x64;$KITSROOT\lib\$SDKVERSION\um\x64;$MATLABROOT\lib\$ARCH;$CUDA_LIB_PATH\..;$CUDA_LIB_PATH"
-        LIBPATH="$VCINSTALLDIR\lib\x64;$VCINSTALLDIR\atlmfc\lib\x64"
+        PATH="$CUDSS_BIN_PATH;$CUDSS_ROOT\bin;$CUDA_ROOT\nvvm\bin;$CUDA_ROOT\bin;$CUDA_LIB_PATH\..;$CUDA_ROOT;$LIBDEVICE;$VCINSTALLDIR\bin\HostX64\x64\;$VCROOT\Common7\IDE\VC\vcpackages;$VCROOT\Common7\IDE;$VCROOT\Common7\Tools;$SDKROOT\Bin\$SDKVERSION\x64;$SDKROOT\Bin\$SDKVERSION\x86;$SDKROOT\Bin\x64;$SDKROOT\Bin\x86;"
+
+        INCLUDE="$CUDA_ROOT\include;$CUDSS_ROOT\include;$VCINSTALLDIR\include;$VCINSTALLDIR\atlmfc\include;$KITSROOT\include\$SDKVERSION\ucrt;$KITSROOT\include\$SDKVERSION\shared;$KITSROOT\include\$SDKVERSION\um;$KITSROOT\include\$SDKVERSION\winrt;$MATLABROOT\extern\include;$MATLABROOT\toolbox\parallel\gpu\extern\include"
+
+        LIB="$VCINSTALLDIR\lib\x64;$VCINSTALLDIR\atlmfc\lib\x64;$KITSROOT\Lib\$SDKVERSION\ucrt\x64;$KITSROOT\lib\$SDKVERSION\um\x64;$MATLABROOT\lib\$ARCH;$CUDA_LIB_PATH\..;$CUDA_LIB_PATH;$CUDSS_LIB_PATH"
+
+        LIBPATH="$VCINSTALLDIR\lib\x64;$VCINSTALLDIR\atlmfc\lib\x64;$CUDSS_LIB_PATH"
     />
+
 </config>

@@ -1,5 +1,6 @@
-function H = Build_GPU_Hierarchy( ...
-    meshHierarchy_)
+function H = Build_GPU_Hierarchy(meshHierarchy_)
+
+    global weightFactorJacobi_;
 
     numLevels = numel(meshHierarchy_);
 
@@ -17,6 +18,8 @@ function H = Build_GPU_Hierarchy( ...
     H.numNodes    = zeros(1, numLevels, 'int32');
     H.numElements = zeros(1, numLevels, 'int32');
     H.numDOFs     = zeros(1, numLevels, 'int32');
+
+    H.numLevels = int32(numLevels);
 
     for level = 1:numLevels
 
@@ -50,7 +53,6 @@ function H = Build_GPU_Hierarchy( ...
         H.numDOFs(level) = ...
             int32(meshHierarchy_(level).numDOFs);
 
-        % Only non-coarsest levels use diagK.
         if level < numLevels
             H.diagK{level} = ...
                 double(meshHierarchy_(level).diagK(:));
@@ -58,17 +60,11 @@ function H = Build_GPU_Hierarchy( ...
             H.diagK{level} = [];
         end
 
-        % eleModulus is required by K*U.
-        %
-        % Your coarse levels currently show eleModulus = [].
-        % Therefore this must be resolved before applying kbyu_kernel
-        % on those levels. The current V-cycle does not need coarse
-        % K*U, so only level 1 requires eleModulus for MGPCG.
-        if isempty(meshHierarchy_(level).eleModulus)
-            H.eleModulus{level} = [];
-        else
+        if level == 1
             H.eleModulus{level} = ...
                 double(meshHierarchy_(level).eleModulus(:));
+        else
+            H.eleModulus{level} = [];
         end
     end
 
@@ -79,12 +75,17 @@ function H = Build_GPU_Hierarchy( ...
             int32(meshHierarchy_(fineLevel + 1).spanWidth);
     end
 
-    H.Ke = double(meshHierarchy_(1).Ke);
+H.Ke = double(meshHierarchy_(1).Ke);
 
-    H.fixedDOFIds = ...
-        int32(find(meshHierarchy_(1).fixedDOFs));
+H.fixedDOFIds = ...
+    int32(find(meshHierarchy_(1).fixedDOFs));
 
-    H.coarseFreeDOFIds = ...
-        int32(find(meshHierarchy_(end).freeDOFs));
+H.coarseFreeDOFIds = ...
+    int32(find(meshHierarchy_(end).freeDOFs));
 
+H.jacobiOmega = ...
+    double(weightFactorJacobi_);
+
+H.coarseKFree = ...
+    sparse(meshHierarchy_(end).Kfree);
 end

@@ -120,19 +120,40 @@ function Solving_AssembleFEAstencil()
 	end
 	meshHierarchy_(1).diagK = reshape(diagK',meshHierarchy_(1).numDOFs,1);
 
-	%% Assemble&Factorize Stiffness Matrix on Coarsest Level
-	[rowIndice, colIndice, ~] = find(ones(24));	
+	%% Assemble & factorize stiffness matrix on coarsest level
+	[rowIndice, colIndice, ~] = find(ones(24));
+
 	sK = zeros(24^2, meshHierarchy_(end).numElements);
-	for ii=1:meshHierarchy_(end).numElements
+
+	for ii = 1:meshHierarchy_(end).numElements
 		sK(:,ii) = reshape(Ks(:,:,ii), 24^2, 1);
 	end
+
 	eNodMat = meshHierarchy_(end).eNodMat;
-	eDofMat = [3*eNodMat-2 3*eNodMat-1 3*eNodMat];
-	eDofMat = eDofMat(:,reOrdering);
-	iK = eDofMat(:,rowIndice);
-	jK = eDofMat(:,colIndice);
+
+	eDofMat = [ ...
+		3*eNodMat-2, ...
+		3*eNodMat-1, ...
+		3*eNodMat];
+
+	eDofMat = eDofMat(:, reOrdering);
+
+	iK = eDofMat(:, rowIndice);
+	jK = eDofMat(:, colIndice);
+
 	KcoarsestLevel = sparse(iK, jK, sK');
-	[cholFac_, ~, cholPermut_] = chol(KcoarsestLevel(meshHierarchy_(end).freeDOFs, meshHierarchy_(end).freeDOFs),'lower');
-	
+
+	coarseFreeDOFs = ...
+		meshHierarchy_(end).freeDOFs(:);
+
+	% This is the matrix both CPU and GPU should solve.
+	meshHierarchy_(end).Kfree = sparse( ...
+		KcoarsestLevel(coarseFreeDOFs, coarseFreeDOFs));
+
+	% CPU factorization.
+	[cholFac_, ~, cholPermut_] = chol( ...
+		meshHierarchy_(end).Kfree, ...
+		'lower');
+
 	clear Ks KsPrevious
 end

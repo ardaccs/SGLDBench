@@ -1,4 +1,4 @@
-function IO_LoadBuiltInDatasets(MdlSelect)
+function IO_LoadBuiltInDatasets(MdlSelect, resolution)
 	global loadingCond_;
 	global fixingCond_;
 	%% !!!
@@ -7,17 +7,25 @@ function IO_LoadBuiltInDatasets(MdlSelect)
 	switch MdlSelect
 		case 'Bone'
 			IO_ImportSurfaceMesh('../data/Bone.ply');
-			if 1 %% Target Resolution: 512
+			if resolution == 512
 				FEA_CreateVoxelizedModel(512);
 				FEA_VoxelBasedDiscretization();
-				loadingCond_ = load('../data/Bone_R512_loads.bc'); %%Load prescribed boundary conditions for TESTING
-				fixingCond_ = load('../data/Bone_R512_fixa.bc');
-			else %% Target Resolution: 1200
+
+				loadingCond_ = ...
+					load('../data/Bone_R512_loads.bc');
+
+				fixingCond_ = ...
+					load('../data/Bone_R512_fixa.bc');
+
+			elseif resolution == 1200
 				FEA_CreateVoxelizedModel(1200);
 				FEA_VoxelBasedDiscretization();
-				loadingCond_ = load('../data/Bone_R1200_loads.bc'); %%Load prescribed boundary conditions for TESTING
-				fixingCond_ = load('../data/Bone_R1200_fixa.bc');		
-			end
+
+				loadingCond_ = ...
+					load('../data/Bone_R1200_loads.bc');
+
+				fixingCond_ = ...
+					load('../data/Bone_R1200_fixa.bc');
 		case 'Part'
 			if 1
 				IO_ImportSurfaceMesh('../data/Part.ply');

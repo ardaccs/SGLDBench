@@ -11,21 +11,19 @@ function IO_LoadBuiltInDatasets(MdlSelect, resolution)
 				FEA_CreateVoxelizedModel(512);
 				FEA_VoxelBasedDiscretization();
 
-				loadingCond_ = ...
-					load('../data/Bone_R512_loads.bc');
-
-				fixingCond_ = ...
-					load('../data/Bone_R512_fixa.bc');
+				loadingCond_ = load('../data/Bone_R512_loads.bc');
+				fixingCond_ = load('../data/Bone_R512_fixa.bc');
 
 			elseif resolution == 1200
 				FEA_CreateVoxelizedModel(1200);
 				FEA_VoxelBasedDiscretization();
 
-				loadingCond_ = ...
-					load('../data/Bone_R1200_loads.bc');
+				loadingCond_ = load('../data/Bone_R1200_loads.bc');
 
-				fixingCond_ = ...
-					load('../data/Bone_R1200_fixa.bc');
+				fixingCond_ = load('../data/Bone_R1200_fixa.bc');
+			else
+				IO_ImportTopVoxels('../data/Part_R256.TopVoxel'); %%Create from wrapped voxel file
+			end
 		case 'Part'
 			if 1
 				IO_ImportSurfaceMesh('../data/Part.ply');

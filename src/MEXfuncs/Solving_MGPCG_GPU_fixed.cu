@@ -4,7 +4,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cudss.h>
-
+#include <nvtx3/nvToolsExt.h>
 #include <cstdint>
 #include <climits>
 #include <cstdio>

@@ -134,8 +134,6 @@ struct Level
     double* d_residual = nullptr;
     double* d_temp = nullptr;
 
-    // Kept only because the unchanged fine Jacobi kernel has this argument.
-    // The host code passes the actual output pointer for both x and rTilde.
     double* d_rTilde = nullptr;
 };
 
@@ -202,6 +200,12 @@ struct SolverContext
     double* d_z = nullptr;
     double* d_p = nullptr;
     double* d_Ap = nullptr;
+
+    // CUDA events for timing.
+    cudaEvent_t startEvent;
+    cudaEvent_t stopEvent;
+    float totalVcycleTimeMs = 0.0f;
+    float totalSpMVTimeMs = 0.0f;
 };
 
 __global__ void zeroSelectedDOFsKernel(
@@ -209,14 +213,12 @@ __global__ void zeroSelectedDOFsKernel(
     const int32_t* fixedDOFIds,
     int numFixedDOFs)
 {
-    const int index =
-        blockIdx.x * blockDim.x + threadIdx.x;
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (index >= numFixedDOFs)
         return;
 
-    const int dof =
-        fixedDOFIds[index] - 1;
+    const int dof = fixedDOFIds[index] - 1;
 
     vector[dof] = 0.0;
 }
@@ -251,10 +253,8 @@ __global__ void dampedJacobiSmootherKernelFine(
     const double weightFactorJacobi,
     const int numDOFs)
 {
-    // Calculate the global thread index
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // Ensure we don't read or write out of bounds
     if (idx < numDOFs) {
         // rTilde = weightFactorJacobi * r ./ diagK
         x[idx] = weightFactorJacobi * (r[idx] / diagK[idx]);
@@ -269,10 +269,8 @@ __global__ void dampedJacobiSmootherKernelCoarse(
     const double weightFactorJacobi,
     const int numDOFs)
 {
-    // Calculate the global thread index
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // Ensure we don't read or write out of bounds
     if (idx < numDOFs) {
         // rTilde = weightFactorJacobi * r ./ diagK
         x[idx] = weightFactorJacobi * (r[idx] / diagK[idx]);
@@ -418,8 +416,7 @@ __global__ void interpolateResidualKernel(
     int spanWidth)
 {
     // One thread per active fine node
-    int fineNode =
-        blockIdx.x * blockDim.x + threadIdx.x;
+    int fineNode = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (fineNode >= numFineNodes) {
         return;
@@ -440,8 +437,7 @@ __global__ void interpolateResidualKernel(
      *
      * MATLAB indices are assumed to be 1-based.
      */
-    const int fineGridId =
-        fineNodeGridId[fineNode] - 1;
+    const int fineGridId = fineNodeGridId[fineNode] - 1;
 
     /*
      * MATLAB/column-major node ordering:
@@ -450,16 +446,11 @@ __global__ void interpolateResidualKernel(
      *        + x * numYNodes
      *        + z * numYNodes * numXNodes
      */
-    const int fineY =
-        fineGridId % fineNyNodes;
+    const int fineY = fineGridId % fineNyNodes;
 
-    const int fineX =
-        (fineGridId / fineNyNodes)
-        % fineNxNodes;
+    const int fineX = (fineGridId / fineNyNodes) % fineNxNodes;
 
-    const int fineZ =
-        fineGridId /
-        (fineNyNodes * fineNxNodes);
+    const int fineZ = fineGridId / (fineNyNodes * fineNxNodes);
 
     /*
      * Lower coarse-grid node surrounding this fine node.
@@ -481,29 +472,22 @@ __global__ void interpolateResidualKernel(
      *   fine=1 -> 1
      *   fine=2 -> 0 in the next coarse cell
      */
-    const int offsetY =
-        fineY - coarseBaseY * spanWidth;
+    const int offsetY = fineY - coarseBaseY * spanWidth;
 
-    const int offsetX =
-        fineX - coarseBaseX * spanWidth;
+    const int offsetX = fineX - coarseBaseX * spanWidth;
 
-    const int offsetZ =
-        fineZ - coarseBaseZ * spanWidth;
+    const int offsetZ = fineZ - coarseBaseZ * spanWidth;
 
-    const double invSpan =
-        1.0 / static_cast<double>(spanWidth);
+    const double invSpan = 1.0 / static_cast<double>(spanWidth);
 
     /*
      * Interpolation coordinates within the coarse cell.
      */
-    const double ty =
-        static_cast<double>(offsetY) * invSpan;
+    const double ty = static_cast<double>(offsetY) * invSpan;
 
-    const double tx =
-        static_cast<double>(offsetX) * invSpan;
+    const double tx = static_cast<double>(offsetX) * invSpan;
 
-    const double tz =
-        static_cast<double>(offsetZ) * invSpan;
+    const double tz = static_cast<double>(offsetZ) * invSpan;
 
     /*
      * Candidate coarse coordinates and corresponding 1D weights.
@@ -513,35 +497,17 @@ __global__ void interpolateResidualKernel(
      * base coarse node     weight = 1 - t
      * base + 1 coarse node weight = t
      */
-    const int coarseYs[2] = {
-        coarseBaseY,
-        coarseBaseY + 1
-    };
+    const int coarseYs[2] = { coarseBaseY, coarseBaseY + 1};
 
-    const int coarseXs[2] = {
-        coarseBaseX,
-        coarseBaseX + 1
-    };
+    const int coarseXs[2] = { coarseBaseX, coarseBaseX + 1};
 
-    const int coarseZs[2] = {
-        coarseBaseZ,
-        coarseBaseZ + 1
-    };
+    const int coarseZs[2] = {coarseBaseZ, coarseBaseZ + 1 };
 
-    const double wy[2] = {
-        1.0 - ty,
-        ty
-    };
+    const double wy[2] = {1.0 - ty, ty};
 
-    const double wx[2] = {
-        1.0 - tx,
-        tx
-    };
+    const double wx[2] = {1.0 - tx, tx };
 
-    const double wz[2] = {
-        1.0 - tz,
-        tz
-    };
+    const double wz[2] = {1.0 - tz, tz };
 
     double resultX = 0.0;
     double resultY = 0.0;
@@ -595,29 +561,22 @@ __global__ void interpolateResidualKernel(
                  * 0 means inactive.
                  * Positive values are MATLAB-style 1-based indices.
                  */
-                const int activeCoarseNode =
-                    coarseNodeMapForward[coarseGridId];
+                const int activeCoarseNode = coarseNodeMapForward[coarseGridId];
 
                 if (activeCoarseNode == 0)
                     continue;
 
-                const int coarseNode =
-                    activeCoarseNode - 1;
+                const int coarseNode = activeCoarseNode - 1;
 
-                const double weight =
-                    wx[ix] * wy[iy] * wz[iz];
+                const double weight = wx[ix] * wy[iy] * wz[iz];
 
-                const int input =
-                    3 * coarseNode;
+                const int input = 3 * coarseNode;
 
-                resultX +=
-                    weight * coarseResidual[input + 0];
+                resultX += weight * coarseResidual[input + 0];
 
-                resultY +=
-                    weight * coarseResidual[input + 1];
+                resultY += weight * coarseResidual[input + 1];
 
-                resultZ +=
-                    weight * coarseResidual[input + 2];
+                resultZ += weight * coarseResidual[input + 2];
             }
         }
     }
@@ -644,8 +603,7 @@ __global__ void restrictResidualKernel(
     int spanWidth)
 {
     // Gather per active coarse node
-    int coarseNode =
-        blockIdx.x * blockDim.x + threadIdx.x;
+    int coarseNode = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (coarseNode >= numCoarseNodes) {
         return;
@@ -660,16 +618,11 @@ __global__ void restrictResidualKernel(
 
     int coarseGridId = coarseNodeGridId[coarseNode] - 1;
 
-    int coarseY =
-        coarseGridId % coarseNyNodes;
+    int coarseY = coarseGridId % coarseNyNodes;
 
-    int coarseX =
-        (coarseGridId / coarseNyNodes)
-        % coarseNxNodes;
+    int coarseX = (coarseGridId / coarseNyNodes) % coarseNxNodes;
 
-    int coarseZ =
-        coarseGridId /
-        (coarseNyNodes * coarseNxNodes);
+    int coarseZ = coarseGridId / (coarseNyNodes * coarseNxNodes);
 
     int fineCenterY = spanWidth * coarseY;
     int fineCenterX = spanWidth * coarseX;
@@ -698,8 +651,7 @@ __global__ void restrictResidualKernel(
             if (fineX < 0 || fineX >= fineNxNodes)
                 continue;
 
-            double wx =
-                1.0 - double(abs(dx)) / double(spanWidth);
+            double wx = 1.0 - double(abs(dx)) / double(spanWidth);
             #pragma unroll
             for (int dy = -radius; dy <= radius; ++dy)
             {
@@ -708,8 +660,7 @@ __global__ void restrictResidualKernel(
                 if (fineY < 0 || fineY >= fineNyNodes)
                     continue;
 
-                double wy =
-                    1.0 - double(abs(dy)) / double(spanWidth);
+                double wy = 1.0 - double(abs(dy)) / double(spanWidth);
 
                 int fineGridId =
                     fineY
@@ -727,14 +678,11 @@ __global__ void restrictResidualKernel(
 
                 int input = 3 * fineNode;
 
-                resultX +=
-                    weight * fineResidual[input + 0];
+                resultX += weight * fineResidual[input + 0];
 
-                resultY +=
-                    weight * fineResidual[input + 1];
+                resultY += weight * fineResidual[input + 1];
 
-                resultZ +=
-                    weight * fineResidual[input + 2];
+                resultZ += weight * fineResidual[input + 2];
             }
         }
     }
@@ -791,8 +739,7 @@ static const mxArray* requireField(
     const mxArray* structure,
     const char* fieldName)
 {
-    const mxArray* field =
-        mxGetField(structure, 0, fieldName);
+    const mxArray* field = mxGetField(structure, 0, fieldName);
 
     if (field == nullptr)
     {
@@ -827,8 +774,7 @@ static const mxArray* requireCellEntry(
             static_cast<unsigned long long>(index + 1));
     }
 
-    const mxArray* value =
-        mxGetCell(cellArray, index);
+    const mxArray* value = mxGetCell(cellArray, index);
 
     if (value == nullptr)
     {
@@ -847,9 +793,7 @@ static void requireRealDoubleArray(
     mwSize requiredElements,
     const char* description)
 {
-    if (!mxIsDouble(value) ||
-        mxIsComplex(value) ||
-        mxGetNumberOfElements(value) != requiredElements)
+    if (!mxIsDouble(value) || mxIsComplex(value) || mxGetNumberOfElements(value) != requiredElements)
     {
         mexErrMsgIdAndTxt(
             "mgpcg_gpu:doubleArray",
@@ -864,9 +808,7 @@ static void requireInt32Array(
     mwSize requiredElements,
     const char* description)
 {
-    if (!mxIsInt32(value) ||
-        mxIsComplex(value) ||
-        mxGetNumberOfElements(value) != requiredElements)
+    if (!mxIsInt32(value) || mxIsComplex(value) || mxGetNumberOfElements(value) != requiredElements)
     {
         mexErrMsgIdAndTxt(
             "mgpcg_gpu:int32Array",
@@ -880,10 +822,7 @@ static int readPositiveIntegerScalar(
     const mxArray* value,
     const char* description)
 {
-    if (value == nullptr ||
-        mxGetNumberOfElements(value) != 1 ||
-        !mxIsNumeric(value) ||
-        mxIsComplex(value))
+    if (value == nullptr || mxGetNumberOfElements(value) != 1 || !mxIsNumeric(value) || mxIsComplex(value))
     {
         mexErrMsgIdAndTxt(
             "mgpcg_gpu:integerScalar",
@@ -893,10 +832,7 @@ static int readPositiveIntegerScalar(
 
     const double scalar = mxGetScalar(value);
 
-    if (!std::isfinite(scalar) ||
-        scalar < 1.0 ||
-        std::floor(scalar) != scalar ||
-        scalar > static_cast<double>(INT_MAX))
+    if (!std::isfinite(scalar) || scalar < 1.0 || std::floor(scalar) != scalar || scalar > static_cast<double>(INT_MAX))
     {
         mexErrMsgIdAndTxt(
             "mgpcg_gpu:integerScalar",
@@ -941,93 +877,39 @@ static size_t calculateRequiredGPUBytes(
     size_t bytes = 0;
 
     // Double arrays first so every double pointer remains naturally aligned.
-    addBytes(
-        bytes,
-        static_cast<size_t>(solver.levels[0].numElements),
-        sizeof(double)); // finest eleModulus
+    addBytes( bytes, static_cast<size_t>(solver.levels[0].numElements), sizeof(double)); // finest eleModulus
 
-    for (int levelIndex = 0;
-         levelIndex < solver.numLevels - 1;
-         ++levelIndex)
+    for (int levelIndex = 0; levelIndex < solver.numLevels - 1; ++levelIndex)
     {
-        addBytes(
-            bytes,
-            static_cast<size_t>(solver.levels[levelIndex].numDOFs),
-            sizeof(double)); // diagK
+        addBytes(bytes, static_cast<size_t>(solver.levels[levelIndex].numDOFs), sizeof(double)); // diagK
     }
 
-    const size_t finestDOFs =
-        static_cast<size_t>(solver.levels[0].numDOFs);
+    const size_t finestDOFs = static_cast<size_t>(solver.levels[0].numDOFs);
 
     addBytes(bytes, 6 * finestDOFs, sizeof(double)); // b, y, r, z, p, Ap
+    addBytes(bytes, 2 * static_cast<size_t>(solver.numCoarseFreeDOFs), sizeof(double)); // reduced coarse RHS and x
+    addBytes(bytes, static_cast<size_t>(solver.coarseNNZ), sizeof(double)); // coarse matrix values
 
-    addBytes(
-        bytes,
-        2 * static_cast<size_t>(solver.numCoarseFreeDOFs),
-        sizeof(double)); // reduced coarse RHS and x
-
-    addBytes(
-        bytes,
-        static_cast<size_t>(solver.coarseNNZ),
-        sizeof(double)); // coarse matrix values
-
-    for (int levelIndex = 0;
-         levelIndex < solver.numLevels;
-         ++levelIndex)
+    for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
     {
-        addBytes(
-            bytes,
-            4 * static_cast<size_t>(solver.levels[levelIndex].numDOFs),
-            sizeof(double)); // rhs, x, residual, temp
+        addBytes(bytes, 4 * static_cast<size_t>(solver.levels[levelIndex].numDOFs), sizeof(double)); // rhs, x, residual, temp
     }
 
     // Integer arrays follow all doubles.
-    for (int levelIndex = 0;
-         levelIndex < solver.numLevels;
-         ++levelIndex)
+    for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
     {
         const Level& level = solver.levels[levelIndex];
 
-        addBytes(
-            bytes,
-            static_cast<size_t>(level.numNodes) * 8,
-            sizeof(int32_t));
-
-        addBytes(
-            bytes,
-            static_cast<size_t>(level.numElements) * 8,
-            sizeof(int32_t));
-
-        addBytes(
-            bytes,
-            static_cast<size_t>(level.numNodes),
-            sizeof(int32_t));
-
-        addBytes(
-            bytes,
-            level.numGridNodes,
-            sizeof(int32_t));
+        addBytes(bytes, static_cast<size_t>(level.numNodes) * 8, sizeof(int32_t));
+        addBytes(bytes, static_cast<size_t>(level.numElements) * 8, sizeof(int32_t));
+        addBytes(bytes,static_cast<size_t>(level.numNodes),sizeof(int32_t));
+        addBytes(bytes,level.numGridNodes,sizeof(int32_t));
     }
 
-    addBytes(
-        bytes,
-        static_cast<size_t>(solver.numFixedDOFs),
-        sizeof(int32_t));
-
-    addBytes(
-        bytes,
-        static_cast<size_t>(solver.numCoarseFreeDOFs),
-        sizeof(int32_t));
-
-    addBytes(
-        bytes,
-        static_cast<size_t>(solver.numCoarseFreeDOFs) + 1,
-        sizeof(int32_t)); // coarse row offsets
-
-    addBytes(
-        bytes,
-        static_cast<size_t>(solver.coarseNNZ),
-        sizeof(int32_t)); // coarse column indices
+    addBytes(bytes,static_cast<size_t>(solver.numFixedDOFs),sizeof(int32_t));
+    addBytes(bytes,static_cast<size_t>(solver.numCoarseFreeDOFs),sizeof(int32_t));
+    addBytes(bytes,static_cast<size_t>(solver.numCoarseFreeDOFs) + 1,sizeof(int32_t)); // coarse row offsets
+    addBytes(bytes,static_cast<size_t>(solver.coarseNNZ),sizeof(int32_t)); // coarse column indices
 
     return bytes;
 }
@@ -1040,19 +922,14 @@ static void initializeGPUHierarchy(
     double tolerance,
     int maxIterations)
 {
-    if (hierarchyMx == nullptr ||
-        !mxIsStruct(hierarchyMx) ||
-        mxGetNumberOfElements(hierarchyMx) != 1)
+    if (hierarchyMx == nullptr ||!mxIsStruct(hierarchyMx) ||mxGetNumberOfElements(hierarchyMx) != 1)
     {
         mexErrMsgIdAndTxt(
             "mgpcg_gpu:hierarchy",
             "H must be a scalar MATLAB struct.");
     }
 
-    if (!mxIsDouble(bMx) ||
-        mxIsComplex(bMx) ||
-        !mxIsDouble(yMx) ||
-        mxIsComplex(yMx))
+    if (!mxIsDouble(bMx) ||mxIsComplex(bMx) ||!mxIsDouble(yMx) ||mxIsComplex(yMx))
     {
         mexErrMsgIdAndTxt(
             "mgpcg_gpu:inputType",
@@ -1085,77 +962,36 @@ static void initializeGPUHierarchy(
             "At least two multigrid levels are required.");
     }
 
-    const mxArray* resXField =
-        requireField(hierarchyMx, "resX");
-    const mxArray* resYField =
-        requireField(hierarchyMx, "resY");
-    const mxArray* resZField =
-        requireField(hierarchyMx, "resZ");
-    const mxArray* numNodesField =
-        requireField(hierarchyMx, "numNodes");
-    const mxArray* numElementsField =
-        requireField(hierarchyMx, "numElements");
-    const mxArray* numDOFsField =
-        requireField(hierarchyMx, "numDOFs");
-    const mxArray* spanWidthField =
-        requireField(hierarchyMx, "spanWidth");
+    const mxArray* resXField = requireField(hierarchyMx, "resX");
+    const mxArray* resYField = requireField(hierarchyMx, "resY");
+    const mxArray* resZField = requireField(hierarchyMx, "resZ");
+    const mxArray* numNodesField = requireField(hierarchyMx, "numNodes");
+    const mxArray* numElementsField = requireField(hierarchyMx, "numElements");
+    const mxArray* numDOFsField = requireField(hierarchyMx, "numDOFs");
+    const mxArray* spanWidthField = requireField(hierarchyMx, "spanWidth");
 
-    requireInt32Array(
-        resXField,
-        static_cast<mwSize>(numLevels),
-        "H.resX");
-    requireInt32Array(
-        resYField,
-        static_cast<mwSize>(numLevels),
-        "H.resY");
-    requireInt32Array(
-        resZField,
-        static_cast<mwSize>(numLevels),
-        "H.resZ");
-    requireInt32Array(
-        numNodesField,
-        static_cast<mwSize>(numLevels),
-        "H.numNodes");
-    requireInt32Array(
-        numElementsField,
-        static_cast<mwSize>(numLevels),
-        "H.numElements");
-    requireInt32Array(
-        numDOFsField,
-        static_cast<mwSize>(numLevels),
-        "H.numDOFs");
-    requireInt32Array(
-        spanWidthField,
-        static_cast<mwSize>(numLevels - 1),
-        "H.spanWidth");
+    requireInt32Array(resXField,static_cast<mwSize>(numLevels),"H.resX");
+    requireInt32Array(resYField,static_cast<mwSize>(numLevels),"H.resY");
+    requireInt32Array(resZField,static_cast<mwSize>(numLevels),"H.resZ");
+    requireInt32Array(numNodesField,static_cast<mwSize>(numLevels),"H.numNodes");
+    requireInt32Array(numElementsField,static_cast<mwSize>(numLevels),"H.numElements");
+    requireInt32Array(numDOFsField,static_cast<mwSize>(numLevels),"H.numDOFs");
+    requireInt32Array(spanWidthField,static_cast<mwSize>(numLevels - 1),"H.spanWidth");
 
-    const int32_t* resX =
-        static_cast<const int32_t*>(mxGetData(resXField));
-    const int32_t* resY =
-        static_cast<const int32_t*>(mxGetData(resYField));
-    const int32_t* resZ =
-        static_cast<const int32_t*>(mxGetData(resZField));
-    const int32_t* numNodes =
-        static_cast<const int32_t*>(mxGetData(numNodesField));
-    const int32_t* numElements =
-        static_cast<const int32_t*>(mxGetData(numElementsField));
-    const int32_t* numDOFs =
-        static_cast<const int32_t*>(mxGetData(numDOFsField));
-    const int32_t* spanWidth =
-        static_cast<const int32_t*>(mxGetData(spanWidthField));
+    const int32_t* resX = static_cast<const int32_t*>(mxGetData(resXField));
+    const int32_t* resY = static_cast<const int32_t*>(mxGetData(resYField));
+    const int32_t* resZ = static_cast<const int32_t*>(mxGetData(resZField));
+    const int32_t* numNodes = static_cast<const int32_t*>(mxGetData(numNodesField));
+    const int32_t* numElements = static_cast<const int32_t*>(mxGetData(numElementsField));
+    const int32_t* numDOFs = static_cast<const int32_t*>(mxGetData(numDOFsField));
+    const int32_t* spanWidth = static_cast<const int32_t*>(mxGetData(spanWidthField));
 
-    const mxArray* nodeToElementsField =
-        requireField(hierarchyMx, "nodeToElements");
-    const mxArray* eNodMatField =
-        requireField(hierarchyMx, "eNodMat");
-    const mxArray* nodGridIdField =
-        requireField(hierarchyMx, "nodGridId");
-    const mxArray* nodMapForwardField =
-        requireField(hierarchyMx, "nodMapForward");
-    const mxArray* eleModulusField =
-        requireField(hierarchyMx, "eleModulus");
-    const mxArray* diagKField =
-        requireField(hierarchyMx, "diagK");
+    const mxArray* nodeToElementsField = requireField(hierarchyMx, "nodeToElements");
+    const mxArray* eNodMatField = requireField(hierarchyMx, "eNodMat");
+    const mxArray* nodGridIdField = requireField(hierarchyMx, "nodGridId");
+    const mxArray* nodMapForwardField = requireField(hierarchyMx, "nodMapForward");
+    const mxArray* eleModulusField = requireField(hierarchyMx, "eleModulus");
+    const mxArray* diagKField = requireField(hierarchyMx, "diagK");
 
     if (!mxIsCell(nodeToElementsField) ||
         mxGetNumberOfElements(nodeToElementsField) < static_cast<mwSize>(numLevels) ||
@@ -1175,12 +1011,10 @@ static void initializeGPUHierarchy(
             "Hierarchy cell fields do not contain the required number of levels.");
     }
 
-    const mxArray* jacobiOmegaMx =
-        mxGetField(hierarchyMx, 0, "jacobiOmega");
+    const mxArray* jacobiOmegaMx = mxGetField(hierarchyMx, 0, "jacobiOmega");
 
     if (jacobiOmegaMx == nullptr)
-        jacobiOmegaMx =
-            mxGetField(hierarchyMx, 0, "weightFactorJacobi");
+        jacobiOmegaMx = mxGetField(hierarchyMx, 0, "weightFactorJacobi");
 
     if (jacobiOmegaMx == nullptr ||
         !mxIsDouble(jacobiOmegaMx) ||
@@ -1192,8 +1026,7 @@ static void initializeGPUHierarchy(
             "H must contain scalar jacobiOmega or weightFactorJacobi.");
     }
 
-    const double jacobiOmega =
-        mxGetScalar(jacobiOmegaMx);
+    const double jacobiOmega = mxGetScalar(jacobiOmegaMx);
 
     if (!std::isfinite(jacobiOmega))
     {
@@ -1204,25 +1037,18 @@ static void initializeGPUHierarchy(
 
     solver.initialized = false;
     solver.numLevels = numLevels;
-    solver.levels.assign(
-        static_cast<size_t>(numLevels),
-        Level{});
-    solver.spanWidths.resize(
-        static_cast<size_t>(numLevels - 1));
+    solver.levels.assign(static_cast<size_t>(numLevels),Level{});
+    solver.spanWidths.resize(static_cast<size_t>(numLevels - 1));
 
     solver.tolerance = tolerance;
     solver.maxIterations = maxIterations;
     solver.jacobiOmega = jacobiOmega;
-    solver.h_b =
-        static_cast<const double*>(mxGetData(bMx));
-    solver.h_y =
-        static_cast<const double*>(mxGetData(yMx));
+    solver.h_b =static_cast<const double*>(mxGetData(bMx));
+    solver.h_y =static_cast<const double*>(mxGetData(yMx));
     solver.outputRows = mxGetM(bMx);
     solver.outputCols = mxGetN(bMx);
 
-    for (int levelIndex = 0;
-         levelIndex < numLevels;
-         ++levelIndex)
+    for (int levelIndex = 0;levelIndex < numLevels;++levelIndex)
     {
         Level& level =
             solver.levels[levelIndex];
@@ -1230,12 +1056,9 @@ static void initializeGPUHierarchy(
         level.nx = static_cast<int>(resX[levelIndex]);
         level.ny = static_cast<int>(resY[levelIndex]);
         level.nz = static_cast<int>(resZ[levelIndex]);
-        level.numNodes =
-            static_cast<int>(numNodes[levelIndex]);
-        level.numElements =
-            static_cast<int>(numElements[levelIndex]);
-        level.numDOFs =
-            static_cast<int>(numDOFs[levelIndex]);
+        level.numNodes =static_cast<int>(numNodes[levelIndex]);
+        level.numElements =static_cast<int>(numElements[levelIndex]);
+        level.numDOFs =static_cast<int>(numDOFs[levelIndex]);
 
         if (level.nx < 0 ||
             level.ny < 0 ||
@@ -1259,17 +1082,11 @@ static void initializeGPUHierarchy(
                 levelIndex + 1);
         }
 
-        const size_t nyNodes =
-            static_cast<size_t>(level.ny) + 1;
-        const size_t nxNodes =
-            static_cast<size_t>(level.nx) + 1;
-        const size_t nzNodes =
-            static_cast<size_t>(level.nz) + 1;
+        const size_t nyNodes =static_cast<size_t>(level.ny) + 1;
+        const size_t nxNodes =static_cast<size_t>(level.nx) + 1;
+        const size_t nzNodes =static_cast<size_t>(level.nz) + 1;
 
-        level.numGridNodes =
-            checkedMultiply(
-                checkedMultiply(nyNodes, nxNodes),
-                nzNodes);
+        level.numGridNodes =checkedMultiply(checkedMultiply(nyNodes, nxNodes),nzNodes);
 
         if (level.numGridNodes >
             static_cast<size_t>(INT_MAX))
@@ -1280,56 +1097,20 @@ static void initializeGPUHierarchy(
                 levelIndex + 1);
         }
 
-        const mxArray* nodeToElementsMx =
-            requireCellEntry(
-                nodeToElementsField,
-                static_cast<mwIndex>(levelIndex),
-                "nodeToElements");
-        const mxArray* eNodMatMx =
-            requireCellEntry(
-                eNodMatField,
-                static_cast<mwIndex>(levelIndex),
-                "eNodMat");
-        const mxArray* nodGridIdMx =
-            requireCellEntry(
-                nodGridIdField,
-                static_cast<mwIndex>(levelIndex),
-                "nodGridId");
-        const mxArray* nodMapForwardMx =
-            requireCellEntry(
-                nodMapForwardField,
-                static_cast<mwIndex>(levelIndex),
-                "nodMapForward");
+        const mxArray* nodeToElementsMx = requireCellEntry(nodeToElementsField,static_cast<mwIndex>(levelIndex),"nodeToElements");
+        const mxArray* eNodMatMx = requireCellEntry(eNodMatField,static_cast<mwIndex>(levelIndex),"eNodMat");
+        const mxArray* nodGridIdMx = requireCellEntry(nodGridIdField,static_cast<mwIndex>(levelIndex),"nodGridId");
+        const mxArray* nodMapForwardMx = requireCellEntry(nodMapForwardField,static_cast<mwIndex>(levelIndex),"nodMapForward");
 
-        requireInt32Array(
-            nodeToElementsMx,
-            static_cast<mwSize>(level.numNodes) * 8,
-            "H.nodeToElements{level}");
-        requireInt32Array(
-            eNodMatMx,
-            static_cast<mwSize>(level.numElements) * 8,
-            "H.eNodMat{level}");
-        requireInt32Array(
-            nodGridIdMx,
-            static_cast<mwSize>(level.numNodes),
-            "H.nodGridId{level}");
-        requireInt32Array(
-            nodMapForwardMx,
-            static_cast<mwSize>(level.numGridNodes),
-            "H.nodMapForward{level}");
+        requireInt32Array(nodeToElementsMx,static_cast<mwSize>(level.numNodes) * 8,"H.nodeToElements{level}");
+        requireInt32Array(eNodMatMx,static_cast<mwSize>(level.numElements) * 8,"H.eNodMat{level}");
+        requireInt32Array(nodGridIdMx,static_cast<mwSize>(level.numNodes),"H.nodGridId{level}");
+        requireInt32Array(nodMapForwardMx,static_cast<mwSize>(level.numGridNodes),"H.nodMapForward{level}");
 
-        level.h_nodeToElements =
-            static_cast<const int32_t*>(
-                mxGetData(nodeToElementsMx));
-        level.h_eNodMat =
-            static_cast<const int32_t*>(
-                mxGetData(eNodMatMx));
-        level.h_nodGridId =
-            static_cast<const int32_t*>(
-                mxGetData(nodGridIdMx));
-        level.h_nodMapForward =
-            static_cast<const int32_t*>(
-                mxGetData(nodMapForwardMx));
+        level.h_nodeToElements = static_cast<const int32_t*>(mxGetData(nodeToElementsMx));
+        level.h_eNodMat = static_cast<const int32_t*>(mxGetData(eNodMatMx));
+        level.h_nodGridId = static_cast<const int32_t*>(mxGetData(nodGridIdMx));
+        level.h_nodMapForward = static_cast<const int32_t*>(mxGetData(nodMapForwardMx));
 
         validateOneBasedIds(
             level.h_nodGridId,
@@ -1348,26 +1129,15 @@ static void initializeGPUHierarchy(
         if (levelIndex < numLevels - 1)
         {
             const mxArray* diagKMx =
-                requireCellEntry(
-                    diagKField,
-                    static_cast<mwIndex>(levelIndex),
-                    "diagK");
+                requireCellEntry(diagKField,static_cast<mwIndex>(levelIndex),"diagK");
 
-            requireRealDoubleArray(
-                diagKMx,
-                static_cast<mwSize>(level.numDOFs),
-                "H.diagK{level}");
+            requireRealDoubleArray(diagKMx,static_cast<mwSize>(level.numDOFs),"H.diagK{level}");
 
-            level.h_dK =
-                static_cast<const double*>(
-                    mxGetData(diagKMx));
+            level.h_dK = static_cast<const double*>(mxGetData(diagKMx));
 
-            for (int dof = 0;
-                 dof < level.numDOFs;
-                 ++dof)
+            for (int dof = 0;dof < level.numDOFs;++dof)
             {
-                if (!std::isfinite(level.h_dK[dof]) ||
-                    level.h_dK[dof] == 0.0)
+                if (!std::isfinite(level.h_dK[dof]) ||level.h_dK[dof] == 0.0)
                 {
                     mexErrMsgIdAndTxt(
                         "mgpcg_gpu:diagK",
@@ -1377,8 +1147,7 @@ static void initializeGPUHierarchy(
                 }
             }
 
-            const int width =
-                static_cast<int>(spanWidth[levelIndex]);
+            const int width = static_cast<int>(spanWidth[levelIndex]);
 
             if (width <= 0)
             {
@@ -1388,25 +1157,15 @@ static void initializeGPUHierarchy(
                     levelIndex + 1);
             }
 
-            solver.spanWidths[levelIndex] =
-                width;
+            solver.spanWidths[levelIndex] = width;
         }
     }
 
-    const mxArray* eleModulusMx =
-        requireCellEntry(
-            eleModulusField,
-            0,
-            "eleModulus");
+    const mxArray* eleModulusMx = requireCellEntry(eleModulusField,0,"eleModulus");
 
-    requireRealDoubleArray(
-        eleModulusMx,
-        static_cast<mwSize>(solver.levels[0].numElements),
-        "H.eleModulus{1}");
+    requireRealDoubleArray(eleModulusMx,static_cast<mwSize>(solver.levels[0].numElements),"H.eleModulus{1}");
 
-    solver.levels[0].h_eleModulus =
-        static_cast<const double*>(
-            mxGetData(eleModulusMx));
+    solver.levels[0].h_eleModulus = static_cast<const double*>(mxGetData(eleModulusMx));
 
     // The unchanged K-by-U kernel relies on valid one-based connectivity.
     validateOneBasedIds(
@@ -1423,25 +1182,17 @@ static void initializeGPUHierarchy(
         false,
         "H.eNodMat{1}");
 
-    const mxArray* fixedDOFIdsMx =
-        requireField(hierarchyMx, "fixedDOFIds");
+    const mxArray* fixedDOFIdsMx = requireField(hierarchyMx, "fixedDOFIds");
 
-    if (!mxIsInt32(fixedDOFIdsMx) ||
-        mxIsComplex(fixedDOFIdsMx) ||
-        mxGetNumberOfElements(fixedDOFIdsMx) >
-            static_cast<mwSize>(INT_MAX))
+    if (!mxIsInt32(fixedDOFIdsMx) || mxIsComplex(fixedDOFIdsMx) || mxGetNumberOfElements(fixedDOFIdsMx) > static_cast<mwSize>(INT_MAX))
     {
         mexErrMsgIdAndTxt(
             "mgpcg_gpu:fixedDOFIds",
             "H.fixedDOFIds must be an int32 array with at most INT_MAX entries.");
     }
 
-    solver.h_fixedDOFIds =
-        static_cast<const int32_t*>(
-            mxGetData(fixedDOFIdsMx));
-    solver.numFixedDOFs =
-        static_cast<int>(
-            mxGetNumberOfElements(fixedDOFIdsMx));
+    solver.h_fixedDOFIds = static_cast<const int32_t*>(mxGetData(fixedDOFIdsMx));
+    solver.numFixedDOFs = static_cast<int>(mxGetNumberOfElements(fixedDOFIdsMx));
 
     if (solver.numFixedDOFs > 0)
     {
@@ -1453,8 +1204,7 @@ static void initializeGPUHierarchy(
             "H.fixedDOFIds");
     }
 
-    const mxArray* coarseFreeDOFIdsMx =
-        requireField(hierarchyMx, "coarseFreeDOFIds");
+    const mxArray* coarseFreeDOFIdsMx = requireField(hierarchyMx, "coarseFreeDOFIds");
 
     if (!mxIsInt32(coarseFreeDOFIdsMx) ||
         mxIsComplex(coarseFreeDOFIdsMx) ||
@@ -1467,12 +1217,8 @@ static void initializeGPUHierarchy(
             "H.coarseFreeDOFIds must be a nonempty int32 array with at most INT_MAX entries.");
     }
 
-    solver.h_coarseFreeDOFIds =
-        static_cast<const int32_t*>(
-            mxGetData(coarseFreeDOFIdsMx));
-    solver.numCoarseFreeDOFs =
-        static_cast<int>(
-            mxGetNumberOfElements(coarseFreeDOFIdsMx));
+    solver.h_coarseFreeDOFIds = static_cast<const int32_t*>( mxGetData(coarseFreeDOFIdsMx));
+    solver.numCoarseFreeDOFs = static_cast<int>(mxGetNumberOfElements(coarseFreeDOFIdsMx));
 
     validateOneBasedIds(
         solver.h_coarseFreeDOFIds,
@@ -1481,101 +1227,65 @@ static void initializeGPUHierarchy(
         false,
         "H.coarseFreeDOFIds");
 
-    const mxArray* keMx =
-        requireField(hierarchyMx, "Ke");
+    const mxArray* keMx = requireField(hierarchyMx, "Ke");
 
-    requireRealDoubleArray(
-        keMx,
-        24 * 24,
-        "H.Ke");
+    requireRealDoubleArray(keMx,24 * 24, "H.Ke");
 
-    solver.h_Ke =
-        static_cast<const double*>(
-            mxGetData(keMx));
+    solver.h_Ke =static_cast<const double*>(mxGetData(keMx));
 
-    if (mxGetNumberOfElements(bMx) !=
-            static_cast<mwSize>(solver.levels[0].numDOFs) ||
-        mxGetNumberOfElements(yMx) !=
-            static_cast<mwSize>(solver.levels[0].numDOFs))
+    if (mxGetNumberOfElements(bMx) !=static_cast<mwSize>(solver.levels[0].numDOFs) ||mxGetNumberOfElements(yMx) !=static_cast<mwSize>(solver.levels[0].numDOFs))
     {
         mexErrMsgIdAndTxt(
             "mgpcg_gpu:vectorSize",
             "b and y0 must contain finest-level numDOFs entries.");
     }
 
-    const mxArray* coarseKFreeMx =
-        requireField(hierarchyMx, "coarseKFree");
+    const mxArray* coarseKFreeMx = requireField(hierarchyMx, "coarseKFree");
 
-    if (!mxIsSparse(coarseKFreeMx) ||
-        !mxIsDouble(coarseKFreeMx) ||
-        mxIsComplex(coarseKFreeMx))
+    if (!mxIsSparse(coarseKFreeMx) || !mxIsDouble(coarseKFreeMx) || mxIsComplex(coarseKFreeMx))
     {
         mexErrMsgIdAndTxt(
             "mgpcg_gpu:coarseKFree",
             "H.coarseKFree must be a real sparse double matrix.");
     }
 
-    const mwSize coarseRows =
-        mxGetM(coarseKFreeMx);
-    const mwSize coarseCols =
-        mxGetN(coarseKFreeMx);
+    const mwSize coarseRows = mxGetM(coarseKFreeMx);
+    const mwSize coarseCols = mxGetN(coarseKFreeMx);
 
-    if (coarseRows != coarseCols ||
-        coarseRows !=
-            static_cast<mwSize>(
-                solver.numCoarseFreeDOFs))
+    if (coarseRows != coarseCols || coarseRows != static_cast<mwSize>(solver.numCoarseFreeDOFs))
     {
         mexErrMsgIdAndTxt(
             "mgpcg_gpu:coarseKFreeSize",
             "H.coarseKFree must be numCoarseFreeDOFs-by-numCoarseFreeDOFs.");
     }
 
-    const mwIndex* jc =
-        mxGetJc(coarseKFreeMx);
-    const mwIndex* ir =
-        mxGetIr(coarseKFreeMx);
-    const mwIndex nnz =
-        jc[coarseCols];
+    const mwIndex* jc = mxGetJc(coarseKFreeMx);
+    const mwIndex* ir = mxGetIr(coarseKFreeMx);
+    const mwIndex nnz = jc[coarseCols];
 
-    if (coarseRows >
-            static_cast<mwSize>(INT_MAX) ||
-        nnz >
-            static_cast<mwIndex>(INT_MAX))
+    if (coarseRows > static_cast<mwSize>(INT_MAX) || nnz > static_cast<mwIndex>(INT_MAX))
     {
         mexErrMsgIdAndTxt(
             "mgpcg_gpu:coarseKFreeIndexRange",
             "H.coarseKFree exceeds the int32 CSR limits used by this implementation.");
     }
 
-    solver.h_coarseRowOffsets.resize(
-        static_cast<size_t>(coarseRows) + 1);
-    solver.h_coarseColIndices.resize(
-        static_cast<size_t>(nnz));
+    solver.h_coarseRowOffsets.resize(static_cast<size_t>(coarseRows) + 1);
+    solver.h_coarseColIndices.resize(static_cast<size_t>(nnz));
 
-    for (mwSize i = 0;
-         i <= coarseRows;
-         ++i)
+    for (mwSize i = 0; i <= coarseRows; ++i)
     {
-        solver.h_coarseRowOffsets[i] =
-            static_cast<int32_t>(jc[i]);
+        solver.h_coarseRowOffsets[i] = static_cast<int32_t>(jc[i]);
     }
 
-    for (mwIndex i = 0;
-         i < nnz;
-         ++i)
+    for (mwIndex i = 0; i < nnz; ++i)
     {
-        solver.h_coarseColIndices[i] =
-            static_cast<int32_t>(ir[i]);
+        solver.h_coarseColIndices[i] = static_cast<int32_t>(ir[i]);
     }
 
-    solver.h_coarseValues =
-        static_cast<const double*>(
-            mxGetData(coarseKFreeMx));
-    solver.coarseNNZ =
-        static_cast<int64_t>(nnz);
-
-    solver.size =
-        calculateRequiredGPUBytes(solver);
+    solver.h_coarseValues = static_cast<const double*>(mxGetData(coarseKFreeMx));
+    solver.coarseNNZ = static_cast<int64_t>(nnz);
+    solver.size = calculateRequiredGPUBytes(solver);
 }
 
 static void initializeCoarseSolver(
@@ -1590,10 +1300,7 @@ static void initializeGPU(
     size_t freeMemory = 0;
     size_t totalMemory = 0;
 
-    CUDA_CHECK(
-        cudaMemGetInfo(
-            &freeMemory,
-            &totalMemory));
+    CUDA_CHECK(cudaMemGetInfo(&freeMemory, &totalMemory));
 
     if (solver.size > freeMemory)
     {
@@ -1607,79 +1314,48 @@ static void initializeGPU(
         throw std::runtime_error(message);
     }
 
-    CUDA_CHECK(
-        cudaMalloc(
-            &solver.d_workspace,
-            solver.size));
+    CUDA_CHECK(cudaMalloc(&solver.d_workspace,solver.size));
 
-    char* dW =
-        static_cast<char*>(
-            solver.d_workspace);
+    char* dW = static_cast<char*>(solver.d_workspace);
     size_t offset = 0;
 
-    auto takeDouble =
-        [&](size_t count) -> double*
+    auto takeDouble = [&](size_t count) -> double*
         {
-            const size_t bytes =
-                checkedMultiply(
-                    count,
-                    sizeof(double));
+            const size_t bytes = checkedMultiply(count, sizeof(double));
 
-            if (offset > solver.size ||
-                bytes > solver.size - offset)
+            if (offset > solver.size || bytes > solver.size - offset)
             {
-                throw std::runtime_error(
-                    "Double workspace layout exceeds the allocated buffer.");
+                throw std::runtime_error("Double workspace layout exceeds the allocated buffer.");
             }
 
-            double* pointer =
-                reinterpret_cast<double*>(
-                    dW + offset);
+            double* pointer = reinterpret_cast<double*>(dW + offset);
             offset += bytes;
             return pointer;
         };
 
-    auto takeInt32 =
-        [&](size_t count) -> int32_t*
+    auto takeInt32 = [&](size_t count) -> int32_t*
         {
-            const size_t bytes =
-                checkedMultiply(
-                    count,
-                    sizeof(int32_t));
+            const size_t bytes = checkedMultiply(count, sizeof(int32_t));
 
-            if (offset > solver.size ||
-                bytes > solver.size - offset)
+            if (offset > solver.size || bytes > solver.size - offset)
             {
-                throw std::runtime_error(
-                    "Integer workspace layout exceeds the allocated buffer.");
+                throw std::runtime_error("Integer workspace layout exceeds the allocated buffer.");
             }
 
-            int32_t* pointer =
-                reinterpret_cast<int32_t*>(
-                    dW + offset);
+            int32_t* pointer = reinterpret_cast<int32_t*>(dW + offset);
             offset += bytes;
             return pointer;
         };
 
     // All double arrays.
-    solver.levels[0].d_eleModulus =
-        takeDouble(
-            static_cast<size_t>(
-                solver.levels[0].numElements));
+    solver.levels[0].d_eleModulus = takeDouble(static_cast<size_t>(solver.levels[0].numElements));
 
-    for (int levelIndex = 0;
-         levelIndex < solver.numLevels - 1;
-         ++levelIndex)
+    for (int levelIndex = 0;levelIndex < solver.numLevels - 1;++levelIndex)
     {
-        solver.levels[levelIndex].d_dK =
-            takeDouble(
-                static_cast<size_t>(
-                    solver.levels[levelIndex].numDOFs));
+        solver.levels[levelIndex].d_dK = takeDouble(static_cast<size_t>(solver.levels[levelIndex].numDOFs));
     }
 
-    const size_t finestDOFs =
-        static_cast<size_t>(
-            solver.levels[0].numDOFs);
+    const size_t finestDOFs = static_cast<size_t>(solver.levels[0].numDOFs);
 
     solver.d_b = takeDouble(finestDOFs);
     solver.d_y = takeDouble(finestDOFs);
@@ -1688,235 +1364,123 @@ static void initializeGPU(
     solver.d_p = takeDouble(finestDOFs);
     solver.d_Ap = takeDouble(finestDOFs);
 
-    solver.d_coarseRhsFree =
-        takeDouble(
-            static_cast<size_t>(
-                solver.numCoarseFreeDOFs));
-    solver.d_coarseXFree =
-        takeDouble(
-            static_cast<size_t>(
-                solver.numCoarseFreeDOFs));
-    solver.d_coarseValues =
-        takeDouble(
-            static_cast<size_t>(
-                solver.coarseNNZ));
+    solver.d_coarseRhsFree = takeDouble(static_cast<size_t>(solver.numCoarseFreeDOFs));
+    solver.d_coarseXFree = takeDouble(static_cast<size_t>(solver.numCoarseFreeDOFs));
+    solver.d_coarseValues = takeDouble(static_cast<size_t>(solver.coarseNNZ));
 
-    for (int levelIndex = 0;
-         levelIndex < solver.numLevels;
-         ++levelIndex)
+    for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
     {
-        Level& level =
-            solver.levels[levelIndex];
+        Level& level = solver.levels[levelIndex];
 
-        level.d_rhs =
-            takeDouble(
-                static_cast<size_t>(
-                    level.numDOFs));
-        level.d_x =
-            takeDouble(
-                static_cast<size_t>(
-                    level.numDOFs));
-        level.d_residual =
-            takeDouble(
-                static_cast<size_t>(
-                    level.numDOFs));
-        level.d_temp =
-            takeDouble(
-                static_cast<size_t>(
-                    level.numDOFs));
+        level.d_rhs = takeDouble(static_cast<size_t>(level.numDOFs));
+        level.d_x =takeDouble(static_cast<size_t>(level.numDOFs));
+        level.d_residual =takeDouble(static_cast<size_t>(level.numDOFs));
+        level.d_temp = takeDouble(static_cast<size_t>(level.numDOFs));
         level.d_rTilde = nullptr;
     }
 
     // All integer arrays.
-    for (int levelIndex = 0;
-         levelIndex < solver.numLevels;
-         ++levelIndex)
+    for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
     {
-        Level& level =
-            solver.levels[levelIndex];
+        Level& level = solver.levels[levelIndex];
 
-        level.d_nodeToElements =
-            takeInt32(
-                static_cast<size_t>(
-                    level.numNodes) * 8);
-        level.d_eNodMat =
-            takeInt32(
-                static_cast<size_t>(
-                    level.numElements) * 8);
-        level.d_nodGridId =
-            takeInt32(
-                static_cast<size_t>(
-                    level.numNodes));
-        level.d_nodMapForward =
-            takeInt32(
-                level.numGridNodes);
+        level.d_nodeToElements = takeInt32(static_cast<size_t>(level.numNodes) * 8);
+        level.d_eNodMat = takeInt32(static_cast<size_t>(level.numElements) * 8);
+        level.d_nodGridId = takeInt32(static_cast<size_t>(level.numNodes));
+        level.d_nodMapForward = takeInt32(level.numGridNodes);
     }
 
-    solver.d_fixedDOFIds =
-        takeInt32(
-            static_cast<size_t>(
-                solver.numFixedDOFs));
-    solver.d_coarseFreeDOFIds =
-        takeInt32(
-            static_cast<size_t>(
-                solver.numCoarseFreeDOFs));
-    solver.d_coarseRowOffsets =
-        takeInt32(
-            static_cast<size_t>(
-                solver.numCoarseFreeDOFs) + 1);
-    solver.d_coarseColIndices =
-        takeInt32(
-            static_cast<size_t>(
-                solver.coarseNNZ));
+    solver.d_fixedDOFIds = takeInt32(static_cast<size_t>(solver.numFixedDOFs));
+    solver.d_coarseFreeDOFIds = takeInt32(static_cast<size_t>(solver.numCoarseFreeDOFs));
+    solver.d_coarseRowOffsets = takeInt32(static_cast<size_t>(solver.numCoarseFreeDOFs) + 1);
+    solver.d_coarseColIndices = takeInt32(static_cast<size_t>(solver.coarseNNZ));
 
     if (offset != solver.size)
     {
-        throw std::runtime_error(
-            "Internal GPU workspace byte count does not match the allocated size.");
+        throw std::runtime_error("Internal GPU workspace byte count does not match the allocated size.");
     }
 
-    for (int levelIndex = 0;
-         levelIndex < solver.numLevels;
-         ++levelIndex)
+    for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
     {
-        Level& level =
-            solver.levels[levelIndex];
+        Level& level = solver.levels[levelIndex];
 
         CUDA_CHECK(
-            cudaMemcpy(
-                level.d_nodeToElements,
-                level.h_nodeToElements,
-                static_cast<size_t>(
-                    level.numNodes) *
-                    8 * sizeof(int32_t),
+            cudaMemcpy(level.d_nodeToElements, level.h_nodeToElements,
+                static_cast<size_t>(level.numNodes) * 8 * sizeof(int32_t),
                 cudaMemcpyHostToDevice));
 
         CUDA_CHECK(
-            cudaMemcpy(
-                level.d_eNodMat,
-                level.h_eNodMat,
-                static_cast<size_t>(
-                    level.numElements) *
-                    8 * sizeof(int32_t),
+            cudaMemcpy(level.d_eNodMat, level.h_eNodMat,
+                static_cast<size_t>(level.numElements) * 8 * sizeof(int32_t),
                 cudaMemcpyHostToDevice));
 
         CUDA_CHECK(
-            cudaMemcpy(
-                level.d_nodGridId,
-                level.h_nodGridId,
-                static_cast<size_t>(
-                    level.numNodes) *
-                    sizeof(int32_t),
+            cudaMemcpy(level.d_nodGridId, level.h_nodGridId,
+                static_cast<size_t>(level.numNodes) * sizeof(int32_t),
                 cudaMemcpyHostToDevice));
 
         CUDA_CHECK(
-            cudaMemcpy(
-                level.d_nodMapForward,
-                level.h_nodMapForward,
-                level.numGridNodes *
-                    sizeof(int32_t),
+            cudaMemcpy(level.d_nodMapForward, level.h_nodMapForward,
+                level.numGridNodes * sizeof(int32_t),
                 cudaMemcpyHostToDevice));
 
         if (levelIndex == 0)
         {
             CUDA_CHECK(
-                cudaMemcpy(
-                    level.d_eleModulus,
-                    level.h_eleModulus,
-                    static_cast<size_t>(
-                        level.numElements) *
-                        sizeof(double),
+                cudaMemcpy(level.d_eleModulus, level.h_eleModulus,
+                    static_cast<size_t>(level.numElements) * sizeof(double),
                     cudaMemcpyHostToDevice));
         }
 
         if (levelIndex < solver.numLevels - 1)
         {
             CUDA_CHECK(
-                cudaMemcpy(
-                    level.d_dK,
-                    level.h_dK,
-                    static_cast<size_t>(
-                        level.numDOFs) *
-                        sizeof(double),
+                cudaMemcpy(level.d_dK, level.h_dK,
+                    static_cast<size_t>(level.numDOFs) * sizeof(double),
                     cudaMemcpyHostToDevice));
         }
 
         CUDA_CHECK(
             cudaMemset(
-                level.d_rhs,
-                0,
-                static_cast<size_t>(
-                    level.numDOFs) *
-                    sizeof(double)));
+                level.d_rhs, 0,
+                static_cast<size_t>(level.numDOFs) * sizeof(double)));
         CUDA_CHECK(
-            cudaMemset(
-                level.d_x,
-                0,
-                static_cast<size_t>(
-                    level.numDOFs) *
-                    sizeof(double)));
+            cudaMemset(level.d_x, 0,
+                static_cast<size_t>(level.numDOFs) * sizeof(double)));
         CUDA_CHECK(
-            cudaMemset(
-                level.d_residual,
-                0,
-                static_cast<size_t>(
-                    level.numDOFs) *
-                    sizeof(double)));
+            cudaMemset(level.d_residual, 0,
+                static_cast<size_t>(level.numDOFs) * sizeof(double)));
         CUDA_CHECK(
-            cudaMemset(
-                level.d_temp,
-                0,
-                static_cast<size_t>(
-                    level.numDOFs) *
-                    sizeof(double)));
+            cudaMemset(level.d_temp, 0,
+                static_cast<size_t>(level.numDOFs) * sizeof(double)));
     }
 
     if (solver.numFixedDOFs > 0)
     {
         CUDA_CHECK(
-            cudaMemcpy(
-                solver.d_fixedDOFIds,
-                solver.h_fixedDOFIds,
-                static_cast<size_t>(
-                    solver.numFixedDOFs) *
-                    sizeof(int32_t),
+            cudaMemcpy(solver.d_fixedDOFIds, solver.h_fixedDOFIds,
+                static_cast<size_t>(solver.numFixedDOFs) * sizeof(int32_t),
                 cudaMemcpyHostToDevice));
     }
 
     CUDA_CHECK(
-        cudaMemcpy(
-            solver.d_coarseFreeDOFIds,
-            solver.h_coarseFreeDOFIds,
-            static_cast<size_t>(
-                solver.numCoarseFreeDOFs) *
-                sizeof(int32_t),
+        cudaMemcpy(solver.d_coarseFreeDOFIds, solver.h_coarseFreeDOFIds,
+            static_cast<size_t>(solver.numCoarseFreeDOFs) * sizeof(int32_t),
             cudaMemcpyHostToDevice));
 
     CUDA_CHECK(
-        cudaMemcpy(
-            solver.d_coarseRowOffsets,
-            solver.h_coarseRowOffsets.data(),
-            (static_cast<size_t>(
-                solver.numCoarseFreeDOFs) + 1) *
-                sizeof(int32_t),
+        cudaMemcpy(solver.d_coarseRowOffsets, solver.h_coarseRowOffsets.data(),
+            (static_cast<size_t>(solver.numCoarseFreeDOFs) + 1) * sizeof(int32_t),
             cudaMemcpyHostToDevice));
 
     CUDA_CHECK(
-        cudaMemcpy(
-            solver.d_coarseColIndices,
-            solver.h_coarseColIndices.data(),
-            static_cast<size_t>(
-                solver.coarseNNZ) *
-                sizeof(int32_t),
+        cudaMemcpy(solver.d_coarseColIndices, solver.h_coarseColIndices.data(),
+            static_cast<size_t>(solver.coarseNNZ) * sizeof(int32_t),
             cudaMemcpyHostToDevice));
 
     CUDA_CHECK(
-        cudaMemcpy(
-            solver.d_coarseValues,
-            solver.h_coarseValues,
-            static_cast<size_t>(
-                solver.coarseNNZ) *
-                sizeof(double),
+        cudaMemcpy(solver.d_coarseValues, solver.h_coarseValues,
+            static_cast<size_t>(solver.coarseNNZ) * sizeof(double),
             cudaMemcpyHostToDevice));
 
     CUDA_CHECK(
@@ -2251,69 +1815,38 @@ static void applyVcycle(
     const double* d_fineResidual,
     double* d_fineCorrection)
 {
-    // This intentionally reproduces Solving_Vcycle.m exactly:
-    //
-    // 1. Restrict each level's original residual.
-    // 2. Store omega*r/diagK once at each non-coarsest level.
-    // 3. Solve the coarsest system.
-    // 4. On the way up, add interpolation and then add omega*r/diagK again.
-    //
-    // It is therefore not replaced with a textbook residual-correction V-cycle.
-
     constexpr int blockSize = 256;
-    const int lastLevel =
-        solver.numLevels - 1;
+    const int lastLevel = solver.numLevels - 1;
 
-    Level& finest =
-        solver.levels[0];
+    Level& finest = solver.levels[0];
 
     CUDA_CHECK(
-        cudaMemcpy(
-            finest.d_rhs,
-            d_fineResidual,
-            static_cast<size_t>(
-                finest.numDOFs) *
-                sizeof(double),
+        cudaMemcpy(finest.d_rhs, d_fineResidual,
+            static_cast<size_t>(finest.numDOFs) * sizeof(double),
             cudaMemcpyDeviceToDevice));
 
-    for (int levelIndex = 0;
-         levelIndex < solver.numLevels;
-         ++levelIndex)
+    for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
     {
-        Level& level =
-            solver.levels[levelIndex];
+        Level& level = solver.levels[levelIndex];
 
         CUDA_CHECK(
             cudaMemset(
-                level.d_x,
-                0,
-                static_cast<size_t>(
-                    level.numDOFs) *
-                    sizeof(double)));
+                level.d_x, 0,
+                static_cast<size_t>(level.numDOFs) * sizeof(double)));
 
         CUDA_CHECK(
             cudaMemset(
-                level.d_temp,
-                0,
-                static_cast<size_t>(
-                    level.numDOFs) *
-                    sizeof(double)));
+                level.d_temp, 0,
+                static_cast<size_t>(level.numDOFs) * sizeof(double)));
     }
 
-    // MATLAB loop: for ii = 2:numLevels_
-    for (int fineIndex = 0;
-         fineIndex < lastLevel;
-         ++fineIndex)
+    // Restriction
+    for (int fineIndex = 0; fineIndex < lastLevel; ++fineIndex)
     {
-        Level& fine =
-            solver.levels[fineIndex];
-        Level& coarse =
-            solver.levels[fineIndex + 1];
+        Level& fine = solver.levels[fineIndex];
+        Level& coarse = solver.levels[fineIndex + 1];
 
-        const int smoothGrid =
-            gridSizeFor(
-                fine.numDOFs,
-                blockSize);
+        const int smoothGrid = gridSizeFor(fine.numDOFs, blockSize);
 
         if (fineIndex == 0)
         {
@@ -2338,10 +1871,7 @@ static void applyVcycle(
         }
         CUDA_CHECK(cudaGetLastError());
 
-        const int restrictionGrid =
-            gridSizeFor(
-                coarse.numNodes,
-                blockSize);
+        const int restrictionGrid = gridSizeFor(coarse.numNodes, blockSize);
 
         restrictResidualKernel<<<restrictionGrid, blockSize>>>(
             coarse.d_nodGridId,
@@ -2358,29 +1888,19 @@ static void applyVcycle(
             solver.spanWidths[fineIndex]);
         CUDA_CHECK(cudaGetLastError());
     }
-
-    solveCoarsest(
-        solver,
-        solver.levels[lastLevel].d_rhs,
-        solver.levels[lastLevel].d_x);
-
-    // MATLAB loop: for ii = numLevels_:-1:2
-    for (int coarseIndex = lastLevel;
-         coarseIndex >= 1;
-         --coarseIndex)
+    nvtxRangePushA("MGPCG:solveCoarsest");
+    // Solve the coarsest level system with cuDSS.
+    solveCoarsest(solver, solver.levels[lastLevel].d_rhs, solver.levels[lastLevel].d_x);
+    nvtxRangePop();
+    // Interpolation and post-smoothing
+    for (int coarseIndex = lastLevel; coarseIndex >= 1; --coarseIndex)
     {
-        const int fineIndex =
-            coarseIndex - 1;
+        const int fineIndex = coarseIndex - 1;
 
-        Level& fine =
-            solver.levels[fineIndex];
-        Level& coarse =
-            solver.levels[coarseIndex];
+        Level& fine = solver.levels[fineIndex];
+        Level& coarse = solver.levels[coarseIndex];
 
-        const int interpolationGrid =
-            gridSizeFor(
-                fine.numNodes,
-                blockSize);
+        const int interpolationGrid = gridSizeFor(fine.numNodes, blockSize);
 
         // fine.d_temp = P * coarse.d_x
         interpolateResidualKernel<<<interpolationGrid, blockSize>>>(
@@ -2398,10 +1918,7 @@ static void applyVcycle(
             solver.spanWidths[fineIndex]);
         CUDA_CHECK(cudaGetLastError());
 
-        const int dofGrid =
-            gridSizeFor(
-                fine.numDOFs,
-                blockSize);
+        const int dofGrid = gridSizeFor(fine.numDOFs, blockSize);
 
         // Existing first Jacobi term + interpolated coarse correction.
         addVectorsInPlaceKernel<<<dofGrid, blockSize>>>(
@@ -2439,17 +1956,11 @@ static void applyVcycle(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    zeroFixedDOFs(
-        solver,
-        finest.d_x);
+    zeroFixedDOFs(solver, finest.d_x);
 
     CUDA_CHECK(
-        cudaMemcpy(
-            d_fineCorrection,
-            finest.d_x,
-            static_cast<size_t>(
-                finest.numDOFs) *
-                sizeof(double),
+        cudaMemcpy(d_fineCorrection, finest.d_x,
+            static_cast<size_t>(finest.numDOFs) * sizeof(double),
             cudaMemcpyDeviceToDevice));
 }
 
@@ -2471,14 +1982,9 @@ static void applyFinestOperator(
     double* d_Ax)
 {
     constexpr int blockSize = 256;
+    Level& finest = solver.levels[0];
 
-    Level& finest =
-        solver.levels[0];
-
-    const int gridSize =
-        gridSizeFor(
-            finest.numNodes,
-            blockSize);
+    const int gridSize = gridSizeFor(finest.numNodes, blockSize);
 
     kbyu_kernel<<<gridSize, blockSize>>>(
         d_x,
@@ -2491,26 +1997,19 @@ static void applyFinestOperator(
 
     CUDA_CHECK(cudaGetLastError());
 
-    zeroFixedDOFs(
-        solver,
-        d_Ax);
+    zeroFixedDOFs(solver, d_Ax);
 }
 
 static void runMGPCG(
     SolverContext& solver)
 {
-    if (!solver.initialized ||
-        solver.levels.empty() ||
-        solver.cublasHandle == nullptr)
+    if (!solver.initialized || solver.levels.empty() || solver.cublasHandle == nullptr)
     {
-        throw std::runtime_error(
-            "The solver context is not fully initialized.");
+        throw std::runtime_error("The solver context is not fully initialized.");
     }
 
-    const int n =
-        solver.levels[0].numDOFs;
-    cublasHandle_t handle =
-        solver.cublasHandle;
+    const int n = solver.levels[0].numDOFs;
+    cublasHandle_t handle = solver.cublasHandle;
 
     const double one = 1.0;
     const double minusOne = -1.0;
@@ -2519,12 +2018,8 @@ static void runMGPCG(
     solver.relativeResidual = 0.0;
     solver.converged = false;
 
-    zeroFixedDOFs(
-        solver,
-        solver.d_b);
-    zeroFixedDOFs(
-        solver,
-        solver.d_y);
+    zeroFixedDOFs(solver, solver.d_b);
+    zeroFixedDOFs(solver, solver.d_y);
 
     double normB = 0.0;
 
@@ -2537,11 +2032,12 @@ static void runMGPCG(
             &normB));
 
     // r = b - A*y
-    applyFinestOperator(
-        solver,
-        solver.d_y,
-        solver.d_Ap);
+    nvtxRangePushA("MGPCG:applyFinestOperator");
+    applyFinestOperator(solver, solver.d_y,solver.d_Ap);
+    nvtxRangePop();
 
+    nvtxRangePushA("MGPCG:initialResidual");
+    // Copy b to r, then subtract A*y from r to compute the initial residual.
     CUBLAS_CHECK(
         cublasDcopy(
             handle,
@@ -2561,9 +2057,8 @@ static void runMGPCG(
             solver.d_r,
             1));
 
-    zeroFixedDOFs(
-        solver,
-        solver.d_r);
+    nvtxRangePop();
+    zeroFixedDOFs(solver, solver.d_r);
 
     double residualNorm = 0.0;
 
@@ -2575,35 +2070,25 @@ static void runMGPCG(
             1,
             &residualNorm));
 
-    const double residualDenominator =
-        (normB > 0.0)
-            ? normB
-            : 1.0;
+    const double residualDenominator = (normB > 0.0) ? normB : 1.0;
 
-    solver.relativeResidual =
-        residualNorm /
-        residualDenominator;
+    solver.relativeResidual = residualNorm / residualDenominator;
 
-    if (!std::isfinite(
-            solver.relativeResidual))
+    if (!std::isfinite(solver.relativeResidual))
     {
-        throw std::runtime_error(
-            "The initial relative residual is not finite.");
+        throw std::runtime_error("The initial relative residual is not finite.");
     }
 
-    if (solver.relativeResidual <
-            solver.tolerance ||
-        residualNorm == 0.0)
+    if (solver.relativeResidual < solver.tolerance || residualNorm == 0.0)
     {
         solver.converged = true;
         return;
     }
 
     // z = M^{-1}r; p = z; rho = z'*r
-    applyVcycle(
-        solver,
-        solver.d_r,
-        solver.d_z);
+    nvtxRangePushA("MGPCG:applyVcycle1");
+    applyVcycle(solver, solver.d_r, solver.d_z);
+    nvtxRangePop();
 
     CUBLAS_CHECK(
         cublasDcopy(
@@ -2626,22 +2111,18 @@ static void runMGPCG(
             1,
             &rho));
 
-    if (!std::isfinite(rho) ||
-        rho <= 0.0)
+    if (!std::isfinite(rho) || rho <= 0.0)
     {
-        throw std::runtime_error(
-            "PCG breakdown: the initial z'*r is non-positive or non-finite.");
+        throw std::runtime_error("PCG breakdown: the initial z'*r is non-positive or non-finite.");
     }
 
-    for (int its = 1;
-         its <= solver.maxIterations;
-         ++its)
+    // Start the main PCG iteration loop.
+    nvtxRangePushA("MGPCG:mainLoop");
+    for (int its = 1; its <= solver.maxIterations; ++its)
     {
-        applyFinestOperator(
-            solver,
-            solver.d_p,
-            solver.d_Ap);
-
+        nvtxRangePushA("MGPCG:applyFinestOperator");
+        applyFinestOperator(solver, solver.d_p, solver.d_Ap);
+        nvtxRangePop();
         double pAp = 0.0;
 
         CUBLAS_CHECK(
@@ -2654,8 +2135,7 @@ static void runMGPCG(
                 1,
                 &pAp));
 
-        if (!std::isfinite(pAp) ||
-            pAp <= 0.0)
+        if (!std::isfinite(pAp) || pAp <= 0.0)
         {
             char message[512];
             std::snprintf(
@@ -2666,17 +2146,14 @@ static void runMGPCG(
             throw std::runtime_error(message);
         }
 
-        const double alpha =
-            rho / pAp;
+        const double alpha = rho / pAp;
 
         if (!std::isfinite(alpha))
         {
-            throw std::runtime_error(
-                "PCG breakdown: alpha is not finite.");
+            throw std::runtime_error("PCG breakdown: alpha is not finite.");
         }
 
-        const double minusAlpha =
-            -alpha;
+        const double minusAlpha = -alpha;
 
         CUBLAS_CHECK(
             cublasDaxpy(
@@ -2698,12 +2175,8 @@ static void runMGPCG(
                 solver.d_r,
                 1));
 
-        zeroFixedDOFs(
-            solver,
-            solver.d_y);
-        zeroFixedDOFs(
-            solver,
-            solver.d_r);
+        zeroFixedDOFs(solver, solver.d_y);
+        zeroFixedDOFs(solver, solver.d_r);
 
         CUBLAS_CHECK(
             cublasDnrm2(
@@ -2714,34 +2187,25 @@ static void runMGPCG(
                 &residualNorm));
 
         solver.iterations = its;
-        solver.relativeResidual =
-            residualNorm /
-            residualDenominator;
+        solver.relativeResidual = residualNorm / residualDenominator;
 
-        if (!std::isfinite(
-                solver.relativeResidual))
+        if (!std::isfinite(solver.relativeResidual))
         {
-            throw std::runtime_error(
-                "PCG produced a non-finite relative residual.");
+            throw std::runtime_error("PCG produced a non-finite relative residual.");
         }
 
-        if (solver.relativeResidual <
-            solver.tolerance)
+        if (solver.relativeResidual < solver.tolerance)
         {
             solver.converged = true;
 
-            MEX_PRINT(
-                "CG solver converged at iteration %d with relative residual %.6e",
+            MEX_PRINT("CG solver converged at iteration %d with relative residual %.6e",
                 its,
                 solver.relativeResidual);
             break;
         }
-
-        applyVcycle(
-            solver,
-            solver.d_r,
-            solver.d_z);
-
+        nvtxRangePushA("MGPCG:applyVcycle2");
+        applyVcycle(solver, solver.d_r, solver.d_z);
+        nvtxRangePop();
         double rhoNew = 0.0;
 
         CUBLAS_CHECK(
@@ -2754,8 +2218,7 @@ static void runMGPCG(
                 1,
                 &rhoNew));
 
-        if (!std::isfinite(rhoNew) ||
-            rhoNew <= 0.0)
+        if (!std::isfinite(rhoNew) || rhoNew <= 0.0)
         {
             char message[512];
             std::snprintf(
@@ -2766,13 +2229,11 @@ static void runMGPCG(
             throw std::runtime_error(message);
         }
 
-        const double beta =
-            rhoNew / rho;
+        const double beta = rhoNew / rho;
 
         if (!std::isfinite(beta))
         {
-            throw std::runtime_error(
-                "PCG breakdown: beta is not finite.");
+            throw std::runtime_error("PCG breakdown: beta is not finite.");
         }
 
         // p = z + beta*p
@@ -2797,9 +2258,9 @@ static void runMGPCG(
         rho = rhoNew;
     }
 
-    if (!solver.converged &&
-        solver.iterations ==
-            solver.maxIterations)
+    nvtxRangePop();
+
+    if (!solver.converged && solver.iterations == solver.maxIterations)
     {
         mexWarnMsgIdAndTxt(
             "mgpcg_gpu:maxIterations",
@@ -2813,34 +2274,21 @@ static void createMATLABOutputs(
     int nlhs,
     mxArray* plhs[])
 {
-    plhs[0] =
-        mxCreateDoubleMatrix(
-            solver.outputRows,
-            solver.outputCols,
-            mxREAL);
+    plhs[0] = mxCreateDoubleMatrix( solver.outputRows, solver.outputCols, mxREAL);
 
     CUDA_CHECK(
-        cudaMemcpy(
-            mxGetData(plhs[0]),
-            solver.d_y,
-            static_cast<size_t>(
-                solver.levels[0].numDOFs) *
-                sizeof(double),
+        cudaMemcpy(mxGetData(plhs[0]), solver.d_y,
+            static_cast<size_t>(solver.levels[0].numDOFs) * sizeof(double),
             cudaMemcpyDeviceToHost));
 
     if (nlhs >= 2)
     {
-        plhs[1] =
-            mxCreateDoubleScalar(
-                static_cast<double>(
-                    solver.iterations));
+        plhs[1] = mxCreateDoubleScalar(static_cast<double>(solver.iterations));
     }
 
     if (nlhs >= 3)
     {
-        plhs[2] =
-            mxCreateDoubleScalar(
-                solver.relativeResidual);
+        plhs[2] = mxCreateDoubleScalar(solver.relativeResidual);
     }
 }
 
@@ -2857,58 +2305,35 @@ void mexFunction(
             "Usage: [y, iterations, relativeResidual] = Solving_MGPCG_GPU(b, tolerance, maxIterations, y0, H)");
     }
 
-    if (nlhs < 1 ||
-        nlhs > 3)
+    if (nlhs < 1 || nlhs > 3)
     {
         mexErrMsgIdAndTxt(
-            "mgpcg_gpu:nlhs",
-            "The function supports one to three outputs.");
+            "mgpcg_gpu:nlhs", "The function supports one to three outputs.");
     }
 
-    if (!mxIsDouble(prhs[1]) ||
-        mxIsComplex(prhs[1]) ||
-        mxGetNumberOfElements(prhs[1]) != 1)
+    if (!mxIsDouble(prhs[1]) || mxIsComplex(prhs[1]) || mxGetNumberOfElements(prhs[1]) != 1)
     {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:tolerance",
-            "tolerance must be a real double scalar.");
+        mexErrMsgIdAndTxt("mgpcg_gpu:tolerance", "tolerance must be a real double scalar.");
     }
 
-    if (!mxIsDouble(prhs[2]) ||
-        mxIsComplex(prhs[2]) ||
-        mxGetNumberOfElements(prhs[2]) != 1)
+    if (!mxIsDouble(prhs[2]) || mxIsComplex(prhs[2]) || mxGetNumberOfElements(prhs[2]) != 1)
     {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:maxIterations",
-            "maxIterations must be a real double scalar containing a positive integer.");
+        mexErrMsgIdAndTxt("mgpcg_gpu:maxIterations", "maxIterations must be a real double scalar containing a positive integer.");
     }
 
-    const double tolerance =
-        mxGetScalar(prhs[1]);
-    const double maxIterationsValue =
-        mxGetScalar(prhs[2]);
+    const double tolerance = mxGetScalar(prhs[1]);
+    const double maxIterationsValue = mxGetScalar(prhs[2]);
 
-    if (!std::isfinite(maxIterationsValue) ||
-        maxIterationsValue < 1.0 ||
-        std::floor(maxIterationsValue) !=
-            maxIterationsValue ||
-        maxIterationsValue >
-            static_cast<double>(INT_MAX))
+    if (!std::isfinite(maxIterationsValue) || maxIterationsValue < 1.0 || std::floor(maxIterationsValue) != maxIterationsValue || maxIterationsValue > static_cast<double>(INT_MAX))
     {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:maxIterations",
-            "maxIterations must be a positive integer representable by int.");
+        mexErrMsgIdAndTxt("mgpcg_gpu:maxIterations", "maxIterations must be a positive integer representable by int.");
     }
 
-    const int maxIterations =
-        static_cast<int>(
-            maxIterationsValue);
+    const int maxIterations = static_cast<int>(maxIterationsValue);
 
     std::string failureMessage;
-
     {
         SolverContext solver;
-
         try
         {
             initializeGPUHierarchy(
@@ -2919,16 +2344,11 @@ void mexFunction(
                 tolerance,
                 maxIterations);
 
-            initializeGPU(
-                solver);
+            initializeGPU(solver);
 
-            runMGPCG(
-                solver);
+            runMGPCG(solver);
 
-            createMATLABOutputs(
-                solver,
-                nlhs,
-                plhs);
+            createMATLABOutputs(solver, nlhs, plhs);
         }
         catch (const std::exception& exception)
         {
@@ -2941,15 +2361,11 @@ void mexFunction(
                 "Unknown C++ exception in Solving_MGPCG_GPU.";
         }
 
-        destroySolver(
-            solver);
+        destroySolver(solver);
     }
 
     if (!failureMessage.empty())
     {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:runtime",
-            "%s",
-            failureMessage.c_str());
+        mexErrMsgIdAndTxt("mgpcg_gpu:runtime","%s",failureMessage.c_str());
     }
 }

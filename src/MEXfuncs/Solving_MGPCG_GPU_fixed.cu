@@ -1893,6 +1893,7 @@ static void applyVcycle(
         const int interpolationGrid = gridSizeFor(fine.numNodes, blockSize);
 
         // fine.d_temp = P * coarse.d_x
+        // Add interpolated coarse correction directly into the existing fine solution.
         interpolateResidualKernel<<<interpolationGrid, blockSize>>>(
             fine.d_nodGridId,
             coarse.d_nodMapForward,
@@ -1906,47 +1907,20 @@ static void applyVcycle(
             fine.ny,
             fine.nz,
             solver.spanWidths[fineIndex]);
+
         CUDA_CHECK(cudaGetLastError());
 
-        const int dofGrid = gridSizeFor(fine.numDOFs, blockSize);
+        const int dofGrid =
+            gridSizeFor(fine.numDOFs, blockSize);
 
-        // Existing first Jacobi term + interpolated coarse correction.
+        // Second additive Jacobi term.
         addDampedJacobiKernel<<<dofGrid, blockSize>>>(
             fine.d_rhs,
             fine.d_dK,
             fine.d_x,
             solver.jacobiOmega,
             fine.numDOFs);
-        CUDA_CHECK(cudaGetLastError());
 
-        // Reuse temp for the second omega*r/diagK term.
-        if (fineIndex == 0)
-        {
-            dampedJacobiSmootherKernelFine<<<dofGrid, blockSize>>>(
-                fine.d_rhs,
-                fine.d_dK,
-                fine.d_x,
-                fine.d_x,
-                solver.jacobiOmega,
-                fine.numDOFs);
-        }
-        else
-        {
-            dampedJacobiSmootherKernelCoarse<<<dofGrid, blockSize>>>(
-                fine.d_rhs,
-                fine.d_dK,
-                fine.d_x,
-                solver.jacobiOmega,
-                fine.numDOFs);
-        }
-        CUDA_CHECK(cudaGetLastError());
-
-        addDampedJacobiKernel<<<dofGrid, blockSize>>>(
-            fine.d_rhs,
-            fine.d_dK,
-            fine.d_x,
-            solver.jacobiOmega,
-            fine.numDOFs);
         CUDA_CHECK(cudaGetLastError());
     }
 

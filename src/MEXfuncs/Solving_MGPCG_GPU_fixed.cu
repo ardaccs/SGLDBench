@@ -196,7 +196,6 @@ struct SolverContext
 
     double* d_y = nullptr;
     double* d_r = nullptr;
-    double* d_z = nullptr;
     double* d_p = nullptr;
     double* d_Ap = nullptr;
 
@@ -885,7 +884,7 @@ static size_t calculateRequiredGPUBytes(
 
     const size_t finestDOFs = static_cast<size_t>(solver.levels[0].numDOFs);
 
-    addBytes(bytes, 5 * finestDOFs, sizeof(double)); // y, r, z, p, Ap
+    addBytes(bytes, 4 * finestDOFs, sizeof(double)); // y, r, p, Ap
     addBytes(bytes, 2 * static_cast<size_t>(solver.numCoarseFreeDOFs), sizeof(double)); // reduced coarse RHS and x
     addBytes(bytes, static_cast<size_t>(solver.coarseNNZ), sizeof(double)); // coarse matrix values
 
@@ -1358,7 +1357,6 @@ static void initializeGPU(
 
     solver.d_y = takeDouble(finestDOFs);
     solver.d_r = takeDouble(finestDOFs);
-    solver.d_z = takeDouble(finestDOFs);
     solver.d_p = takeDouble(finestDOFs);
     solver.d_Ap = takeDouble(finestDOFs);
 
@@ -1494,11 +1492,6 @@ static void initializeGPU(
         finestDOFs * sizeof(double),
         cudaMemcpyHostToDevice));
 
-    CUDA_CHECK(
-        cudaMemset(
-            solver.d_z,
-            0,
-            finestDOFs * sizeof(double)));
     CUDA_CHECK(
         cudaMemset(
             solver.d_p,
@@ -2070,14 +2063,14 @@ static void runMGPCG(
 
     // z = M^{-1}r; p = z; rho = z'*r
     nvtxRangePushA("MGPCG:applyVcycle1");
-    applyVcycle(solver, solver.d_r, solver.d_z);
+    applyVcycle(solver, solver.d_r, solver.d_Ap);
     nvtxRangePop();
 
     CUBLAS_CHECK(
         cublasDcopy(
             handle,
             n,
-            solver.d_z,
+            solver.d_Ap,
             1,
             solver.d_p,
             1));
@@ -2088,7 +2081,7 @@ static void runMGPCG(
         cublasDdot(
             handle,
             n,
-            solver.d_z,
+            solver.d_Ap,
             1,
             solver.d_r,
             1,
@@ -2187,7 +2180,7 @@ static void runMGPCG(
             break;
         }
         nvtxRangePushA("MGPCG:applyVcycle2");
-        applyVcycle(solver, solver.d_r, solver.d_z);
+        applyVcycle(solver, solver.d_r, solver.d_Ap);
         nvtxRangePop();
         double rhoNew = 0.0;
 
@@ -2195,7 +2188,7 @@ static void runMGPCG(
             cublasDdot(
                 handle,
                 n,
-                solver.d_z,
+                solver.d_Ap,
                 1,
                 solver.d_r,
                 1,
@@ -2233,7 +2226,7 @@ static void runMGPCG(
                 handle,
                 n,
                 &one,
-                solver.d_z,
+                solver.d_Ap,
                 1,
                 solver.d_p,
                 1));

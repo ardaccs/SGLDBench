@@ -885,7 +885,7 @@ static size_t calculateRequiredGPUBytes(
 
     const size_t finestDOFs = static_cast<size_t>(solver.levels[0].numDOFs);
 
-    addBytes(bytes, 6 * finestDOFs, sizeof(double)); // b, y, r, z, p, Ap
+    addBytes(bytes, 5 * finestDOFs, sizeof(double)); // y, r, z, p, Ap
     addBytes(bytes, 2 * static_cast<size_t>(solver.numCoarseFreeDOFs), sizeof(double)); // reduced coarse RHS and x
     addBytes(bytes, static_cast<size_t>(solver.coarseNNZ), sizeof(double)); // coarse matrix values
 

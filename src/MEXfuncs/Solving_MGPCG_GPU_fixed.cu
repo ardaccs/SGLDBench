@@ -131,7 +131,6 @@ struct Level
     // V-cycle workspace.
     double* d_rhs = nullptr;
     double* d_x = nullptr;
-    double* d_temp = nullptr;
     double* d_rTilde = nullptr;
 };
 
@@ -271,6 +270,18 @@ __global__ void dampedJacobiSmootherKernelCoarse(
         // rTilde = weightFactorJacobi * r ./ diagK
         x[idx] = weightFactorJacobi * (r[idx] / diagK[idx]);
     }
+}
+__global__ void addDampedJacobiKernel(
+    const double* __restrict__ rhs,
+    const double* __restrict__ diagK,
+    double* __restrict__ x,
+    double omega,
+    int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < n)
+        x[i] += omega * rhs[i] / diagK[i];
 }
 
 __global__ void addVectorsInPlaceKernel(
@@ -579,9 +590,9 @@ __global__ void interpolateResidualKernel(
 
     const int output = 3 * fineNode;
 
-    fineResidual[output + 0] = resultX;
-    fineResidual[output + 1] = resultY;
-    fineResidual[output + 2] = resultZ;
+    fineResidual[output + 0] += resultX;
+    fineResidual[output + 1] += resultY;
+    fineResidual[output + 2] += resultZ;
 }
 
 __global__ void restrictResidualKernel(
@@ -888,7 +899,7 @@ static size_t calculateRequiredGPUBytes(
 
     for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
     {
-        addBytes(bytes, 3 * static_cast<size_t>(solver.levels[levelIndex].numDOFs), sizeof(double)); // rhs, x, residual, temp
+        addBytes(bytes, 2 * static_cast<size_t>(solver.levels[levelIndex].numDOFs), sizeof(double)); // rhs, x, rTilde
     }
     const Level& finest = solver.levels[0];
 
@@ -1377,7 +1388,6 @@ static void initializeGPU(
 
         level.d_rhs = takeDouble(static_cast<size_t>(level.numDOFs));
         level.d_x =takeDouble(static_cast<size_t>(level.numDOFs));
-        level.d_temp = takeDouble(static_cast<size_t>(level.numDOFs));
         level.d_rTilde = nullptr;
     }
 
@@ -1447,9 +1457,7 @@ static void initializeGPU(
         CUDA_CHECK(
             cudaMemset(level.d_x, 0,
                 static_cast<size_t>(level.numDOFs) * sizeof(double)));
-        CUDA_CHECK(
-            cudaMemset(level.d_temp, 0,
-                static_cast<size_t>(level.numDOFs) * sizeof(double)));
+
     }
 
     if (solver.numFixedDOFs > 0)
@@ -1820,10 +1828,6 @@ static void applyVcycle(
                 level.d_x, 0,
                 static_cast<size_t>(level.numDOFs) * sizeof(double)));
 
-        CUDA_CHECK(
-            cudaMemset(
-                level.d_temp, 0,
-                static_cast<size_t>(level.numDOFs) * sizeof(double)));
     }
 
     // Restriction
@@ -1893,7 +1897,7 @@ static void applyVcycle(
             fine.d_nodGridId,
             coarse.d_nodMapForward,
             coarse.d_x,
-            fine.d_temp,
+            fine.d_x,
             fine.numNodes,
             coarse.nx,
             coarse.ny,
@@ -1907,9 +1911,11 @@ static void applyVcycle(
         const int dofGrid = gridSizeFor(fine.numDOFs, blockSize);
 
         // Existing first Jacobi term + interpolated coarse correction.
-        addVectorsInPlaceKernel<<<dofGrid, blockSize>>>(
+        addDampedJacobiKernel<<<dofGrid, blockSize>>>(
+            fine.d_rhs,
+            fine.d_dK,
             fine.d_x,
-            fine.d_temp,
+            solver.jacobiOmega,
             fine.numDOFs);
         CUDA_CHECK(cudaGetLastError());
 
@@ -1919,8 +1925,8 @@ static void applyVcycle(
             dampedJacobiSmootherKernelFine<<<dofGrid, blockSize>>>(
                 fine.d_rhs,
                 fine.d_dK,
-                fine.d_temp,
-                fine.d_temp,
+                fine.d_x,
+                fine.d_x,
                 solver.jacobiOmega,
                 fine.numDOFs);
         }
@@ -1929,15 +1935,17 @@ static void applyVcycle(
             dampedJacobiSmootherKernelCoarse<<<dofGrid, blockSize>>>(
                 fine.d_rhs,
                 fine.d_dK,
-                fine.d_temp,
+                fine.d_x,
                 solver.jacobiOmega,
                 fine.numDOFs);
         }
         CUDA_CHECK(cudaGetLastError());
 
-        addVectorsInPlaceKernel<<<dofGrid, blockSize>>>(
+        addDampedJacobiKernel<<<dofGrid, blockSize>>>(
+            fine.d_rhs,
+            fine.d_dK,
             fine.d_x,
-            fine.d_temp,
+            solver.jacobiOmega,
             fine.numDOFs);
         CUDA_CHECK(cudaGetLastError());
     }

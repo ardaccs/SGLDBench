@@ -131,9 +131,7 @@ struct Level
     // V-cycle workspace.
     double* d_rhs = nullptr;
     double* d_x = nullptr;
-    double* d_residual = nullptr;
     double* d_temp = nullptr;
-
     double* d_rTilde = nullptr;
 };
 
@@ -890,7 +888,7 @@ static size_t calculateRequiredGPUBytes(
 
     for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
     {
-        addBytes(bytes, 4 * static_cast<size_t>(solver.levels[levelIndex].numDOFs), sizeof(double)); // rhs, x, residual, temp
+        addBytes(bytes, 3 * static_cast<size_t>(solver.levels[levelIndex].numDOFs), sizeof(double)); // rhs, x, residual, temp
     }
 
     // Integer arrays follow all doubles.
@@ -1370,7 +1368,6 @@ static void initializeGPU(
 
         level.d_rhs = takeDouble(static_cast<size_t>(level.numDOFs));
         level.d_x =takeDouble(static_cast<size_t>(level.numDOFs));
-        level.d_residual =takeDouble(static_cast<size_t>(level.numDOFs));
         level.d_temp = takeDouble(static_cast<size_t>(level.numDOFs));
         level.d_rTilde = nullptr;
     }
@@ -1442,9 +1439,6 @@ static void initializeGPU(
                 static_cast<size_t>(level.numDOFs) * sizeof(double)));
         CUDA_CHECK(
             cudaMemset(level.d_x, 0,
-                static_cast<size_t>(level.numDOFs) * sizeof(double)));
-        CUDA_CHECK(
-            cudaMemset(level.d_residual, 0,
                 static_cast<size_t>(level.numDOFs) * sizeof(double)));
         CUDA_CHECK(
             cudaMemset(level.d_temp, 0,

@@ -890,14 +890,23 @@ static size_t calculateRequiredGPUBytes(
     {
         addBytes(bytes, 3 * static_cast<size_t>(solver.levels[levelIndex].numDOFs), sizeof(double)); // rhs, x, residual, temp
     }
+    const Level& finest = solver.levels[0];
 
+    // eNodMat and nodeToElements are only used in the finest level kernel, so they can be freed after the first V-cycle. They are not needed for the coarse levels.
+    addBytes(
+        bytes,
+        static_cast<size_t>(finest.numNodes) * 8,
+        sizeof(int32_t));
+
+    addBytes(
+        bytes,
+        static_cast<size_t>(finest.numElements) * 8,
+        sizeof(int32_t));
     // Integer arrays follow all doubles.
     for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
     {
         const Level& level = solver.levels[levelIndex];
 
-        addBytes(bytes, static_cast<size_t>(level.numNodes) * 8, sizeof(int32_t));
-        addBytes(bytes, static_cast<size_t>(level.numElements) * 8, sizeof(int32_t));
         addBytes(bytes,static_cast<size_t>(level.numNodes),sizeof(int32_t));
         addBytes(bytes,level.numGridNodes,sizeof(int32_t));
     }
@@ -1373,12 +1382,13 @@ static void initializeGPU(
     }
 
     // All integer arrays.
+    const Level& finest = solver.levels[0];
+    finest.d_nodeToElements = takeInt32(static_cast<size_t>(finest.numNodes) * 8);
+    finest.d_eNodMat = takeInt32(static_cast<size_t>(finest.numElements) * 8);
     for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
     {
         Level& level = solver.levels[levelIndex];
 
-        level.d_nodeToElements = takeInt32(static_cast<size_t>(level.numNodes) * 8);
-        level.d_eNodMat = takeInt32(static_cast<size_t>(level.numElements) * 8);
         level.d_nodGridId = takeInt32(static_cast<size_t>(level.numNodes));
         level.d_nodMapForward = takeInt32(level.numGridNodes);
     }
@@ -1392,20 +1402,18 @@ static void initializeGPU(
     {
         throw std::runtime_error("Internal GPU workspace byte count does not match the allocated size.");
     }
-
+    const Level& finest = solver.levels[0];
+    CUDA_CHECK(
+        cudaMemcpy(finest.d_eNodMat, finest.h_eNodMat,
+            static_cast<size_t>(finest.numElements) * 8 * sizeof(int32_t),
+            cudaMemcpyHostToDevice));
+    CUDA_CHECK(
+        cudaMemcpy(finest.d_nodeToElements, finest.h_nodeToElements,
+            static_cast<size_t>(finest.numNodes) * 8 * sizeof(int32_t),
+            cudaMemcpyHostToDevice));
     for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
     {
         Level& level = solver.levels[levelIndex];
-
-        CUDA_CHECK(
-            cudaMemcpy(level.d_nodeToElements, level.h_nodeToElements,
-                static_cast<size_t>(level.numNodes) * 8 * sizeof(int32_t),
-                cudaMemcpyHostToDevice));
-
-        CUDA_CHECK(
-            cudaMemcpy(level.d_eNodMat, level.h_eNodMat,
-                static_cast<size_t>(level.numElements) * 8 * sizeof(int32_t),
-                cudaMemcpyHostToDevice));
 
         CUDA_CHECK(
             cudaMemcpy(level.d_nodGridId, level.h_nodGridId,

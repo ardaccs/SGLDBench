@@ -1382,7 +1382,7 @@ static void initializeGPU(
     }
 
     // All integer arrays.
-    const Level& finest = solver.levels[0];
+    Level& finest = solver.levels[0];
     finest.d_nodeToElements = takeInt32(static_cast<size_t>(finest.numNodes) * 8);
     finest.d_eNodMat = takeInt32(static_cast<size_t>(finest.numElements) * 8);
     for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
@@ -1402,7 +1402,6 @@ static void initializeGPU(
     {
         throw std::runtime_error("Internal GPU workspace byte count does not match the allocated size.");
     }
-    const Level& finest = solver.levels[0];
     CUDA_CHECK(
         cudaMemcpy(finest.d_eNodMat, finest.h_eNodMat,
             static_cast<size_t>(finest.numElements) * 8 * sizeof(int32_t),

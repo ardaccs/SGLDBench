@@ -1488,11 +1488,12 @@ static void initializeGPU(
             finestDOFs * sizeof(double),
             cudaMemcpyHostToDevice));
 
-    CUDA_CHECK(
-        cudaMemset(
-            solver.d_r,
-            0,
-            finestDOFs * sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(
+        solver.d_r,
+        solver.h_b,
+        finestDOFs * sizeof(double),
+        cudaMemcpyHostToDevice));
+
     CUDA_CHECK(
         cudaMemset(
             solver.d_z,

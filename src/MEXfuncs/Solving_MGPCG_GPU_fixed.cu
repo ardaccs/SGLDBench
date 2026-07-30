@@ -194,7 +194,6 @@ struct SolverContext
     const double* h_b = nullptr;
     const double* h_y = nullptr;
 
-    double* d_b = nullptr;
     double* d_y = nullptr;
     double* d_r = nullptr;
     double* d_z = nullptr;
@@ -1357,7 +1356,6 @@ static void initializeGPU(
 
     const size_t finestDOFs = static_cast<size_t>(solver.levels[0].numDOFs);
 
-    solver.d_b = takeDouble(finestDOFs);
     solver.d_y = takeDouble(finestDOFs);
     solver.d_r = takeDouble(finestDOFs);
     solver.d_z = takeDouble(finestDOFs);
@@ -1481,13 +1479,6 @@ static void initializeGPU(
     CUDA_CHECK(
         cudaMemcpy(solver.d_coarseValues, solver.h_coarseValues,
             static_cast<size_t>(solver.coarseNNZ) * sizeof(double),
-            cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(
-        cudaMemcpy(
-            solver.d_b,
-            solver.h_b,
-            finestDOFs * sizeof(double),
             cudaMemcpyHostToDevice));
 
     CUDA_CHECK(
@@ -2018,7 +2009,7 @@ static void runMGPCG(
     solver.relativeResidual = 0.0;
     solver.converged = false;
 
-    zeroFixedDOFs(solver, solver.d_b);
+    zeroFixedDOFs(solver, solver.d_r);
     zeroFixedDOFs(solver, solver.d_y);
 
     double normB = 0.0;
@@ -2027,7 +2018,7 @@ static void runMGPCG(
         cublasDnrm2(
             handle,
             n,
-            solver.d_b,
+            solver.d_r,
             1,
             &normB));
 
@@ -2037,15 +2028,6 @@ static void runMGPCG(
     nvtxRangePop();
 
     nvtxRangePushA("MGPCG:initialResidual");
-    // Copy b to r, then subtract A*y from r to compute the initial residual.
-    CUBLAS_CHECK(
-        cublasDcopy(
-            handle,
-            n,
-            solver.d_b,
-            1,
-            solver.d_r,
-            1));
 
     CUBLAS_CHECK(
         cublasDaxpy(

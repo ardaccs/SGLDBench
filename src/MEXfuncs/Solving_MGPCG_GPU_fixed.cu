@@ -884,7 +884,7 @@ static size_t calculateRequiredGPUBytes(
     size_t bytes = 0;
 
     // Double arrays first so every double pointer remains naturally aligned.
-    addBytes( bytes, static_cast<size_t>(solver.levels[0].numElements), sizeof(double)); // finest eleModulus
+    addBytes(bytes, static_cast<size_t>(solver.levels[0].numElements), sizeof(double)); // finest eleModulus
 
     for (int levelIndex = 0; levelIndex < solver.numLevels - 1; ++levelIndex)
     {
@@ -897,13 +897,19 @@ static size_t calculateRequiredGPUBytes(
     addBytes(bytes, 2 * static_cast<size_t>(solver.numCoarseFreeDOFs), sizeof(double)); // reduced coarse RHS and x
     addBytes(bytes, static_cast<size_t>(solver.coarseNNZ), sizeof(double)); // coarse matrix values
 
-    for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
+    // Finest rhs aliases d_r and finest x aliases d_Ap.
+    // Therefore separate rhs/x storage is needed only for levels 1...N-1.
+    for (int levelIndex = 1; levelIndex < solver.numLevels; ++levelIndex)
     {
-        addBytes(bytes, 2 * static_cast<size_t>(solver.levels[levelIndex].numDOFs), sizeof(double)); // rhs, x, rTilde
+        addBytes(
+            bytes,
+            2 * static_cast<size_t>(solver.levels[levelIndex].numDOFs),
+            sizeof(double));
     }
+
     const Level& finest = solver.levels[0];
 
-    // eNodMat and nodeToElements are only used in the finest level kernel, so they can be freed after the first V-cycle. They are not needed for the coarse levels.
+    // eNodMat and nodeToElements.
     addBytes(
         bytes,
         static_cast<size_t>(finest.numNodes) * 8,
@@ -913,19 +919,20 @@ static size_t calculateRequiredGPUBytes(
         bytes,
         static_cast<size_t>(finest.numElements) * 8,
         sizeof(int32_t));
+
     // Integer arrays follow all doubles.
     for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
     {
         const Level& level = solver.levels[levelIndex];
 
-        addBytes(bytes,static_cast<size_t>(level.numNodes),sizeof(int32_t));
-        addBytes(bytes,level.numGridNodes,sizeof(int32_t));
+        addBytes(bytes, static_cast<size_t>(level.numNodes), sizeof(int32_t));
+        addBytes(bytes, level.numGridNodes, sizeof(int32_t));
     }
 
-    addBytes(bytes,static_cast<size_t>(solver.numFixedDOFs),sizeof(int32_t));
-    addBytes(bytes,static_cast<size_t>(solver.numCoarseFreeDOFs),sizeof(int32_t));
-    addBytes(bytes,static_cast<size_t>(solver.numCoarseFreeDOFs) + 1,sizeof(int32_t)); // coarse row offsets
-    addBytes(bytes,static_cast<size_t>(solver.coarseNNZ),sizeof(int32_t)); // coarse column indices
+    addBytes(bytes, static_cast<size_t>(solver.numFixedDOFs), sizeof(int32_t));
+    addBytes(bytes, static_cast<size_t>(solver.numCoarseFreeDOFs), sizeof(int32_t));
+    addBytes(bytes, static_cast<size_t>(solver.numCoarseFreeDOFs) + 1, sizeof(int32_t));
+    addBytes(bytes, static_cast<size_t>(solver.coarseNNZ), sizeof(int32_t));
 
     return bytes;
 }
@@ -1382,12 +1389,18 @@ static void initializeGPU(
     solver.d_coarseXFree = takeDouble(static_cast<size_t>(solver.numCoarseFreeDOFs));
     solver.d_coarseValues = takeDouble(static_cast<size_t>(solver.coarseNNZ));
 
-    for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
+    // Finest MG workspace aliases existing PCG vectors.
+    solver.levels[0].d_rhs = solver.d_r;
+    solver.levels[0].d_x = solver.d_Ap;
+    solver.levels[0].d_rTilde = nullptr;
+
+    // Allocate separate MG rhs/x only for coarse levels.
+    for (int levelIndex = 1; levelIndex < solver.numLevels; ++levelIndex)
     {
         Level& level = solver.levels[levelIndex];
 
         level.d_rhs = takeDouble(static_cast<size_t>(level.numDOFs));
-        level.d_x =takeDouble(static_cast<size_t>(level.numDOFs));
+        level.d_x = takeDouble(static_cast<size_t>(level.numDOFs));
         level.d_rTilde = nullptr;
     }
 
@@ -1814,10 +1827,15 @@ static void applyVcycle(
 
     Level& finest = solver.levels[0];
 
-    CUDA_CHECK(
-        cudaMemcpy(finest.d_rhs, d_fineResidual,
-            static_cast<size_t>(finest.numDOFs) * sizeof(double),
-            cudaMemcpyDeviceToDevice));
+    if (finest.d_rhs != d_fineResidual)
+    {
+        CUDA_CHECK(
+            cudaMemcpy(
+                finest.d_rhs,
+                d_fineResidual,
+                static_cast<size_t>(finest.numDOFs) * sizeof(double),
+                cudaMemcpyDeviceToDevice));
+    }
 
     for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
     {
@@ -1926,10 +1944,15 @@ static void applyVcycle(
 
     zeroFixedDOFs(solver, finest.d_x);
 
-    CUDA_CHECK(
-        cudaMemcpy(d_fineCorrection, finest.d_x,
-            static_cast<size_t>(finest.numDOFs) * sizeof(double),
-            cudaMemcpyDeviceToDevice));
+    if (d_fineCorrection != finest.d_x)
+    {
+        CUDA_CHECK(
+            cudaMemcpy(
+                d_fineCorrection,
+                finest.d_x,
+                static_cast<size_t>(finest.numDOFs) * sizeof(double),
+                cudaMemcpyDeviceToDevice));
+    }
 }
 
 __global__ void substractVectorsInPlaceKernel(

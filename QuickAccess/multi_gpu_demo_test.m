@@ -472,7 +472,8 @@ fprintf('\n========================================\n');
 fprintf(' TESTING TWO-GPU MATRIX-VECTOR PRODUCT\n');
 fprintf('========================================\n');
 tGPU = tic;
-[Y, r] = Solving_KbyU_MatrixFree_MGPU(H, b, y0, KeTest, numGPUs);
+[Y, r] = Solving_KbyU_MatrixFree_MGPU( ...
+    H(1), b, y0, KeTest, numGPUs);
 fprintf('MEX elapsed time (includes allocation/transfers): %.3f s\n', toc(tGPU));
 assert(isequal(size(Y), size(y0)) && isequal(size(r), size(b)), ...
        'MEX output dimensions are incorrect.');

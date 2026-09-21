@@ -429,28 +429,7 @@ assert(isa(KeTest, 'double') && isreal(KeTest) && ...
 assert(numel(mesh.eleModulus) == mesh.numElements, ...
     'Global eleModulus must have one entry per active element.');
 
-% Build the H(1:2) struct expected by the current MEX. IMPORTANT:
-% sharedNodesLocal{otherGPU} is indexed in the SAME global-node order
-% for both partitions; intersect returns sorted matching global IDs.
-H = repmat(struct('numNodes', 0, 'numElements', 0, ...
-    'nodeToElements', [], 'eNodMat', [], 'eleModulus', [], ...
-    'sharedNodesLocal', {{[], []}}), 1, numGPUs);
-[sharedGlobal, sharedLocal1, sharedLocal2] = intersect( ...
-    P{1}.globalNodeIds(:), P{2}.globalNodeIds(:));
-assert(~isempty(sharedGlobal), 'No shared interface nodes.');
-for g = 1:numGPUs
-    H(g).numNodes       = double(P{g}.numNodes);
-    H(g).numElements    = double(P{g}.numElements);
-    H(g).nodeToElements = int32(P{g}.nodeToElements);
-    H(g).eNodMat        = int32(P{g}.eNodMat);
-    H(g).eleModulus     = double(mesh.eleModulus(double(P{g}.elementIds(:))));
-    H(g).sharedNodesLocal = cell(1, numGPUs);
-end
-H(1).sharedNodesLocal{2} = int32(sharedLocal1(:));
-H(2).sharedNodesLocal{1} = int32(sharedLocal2(:));
-assert(isequal(P{1}.globalNodeIds(sharedLocal1), ...
-               P{2}.globalNodeIds(sharedLocal2)), ...
-       'Interface node ordering is inconsistent.');
+H = Build_GPU_Hierarchy_MGPU(mesh, 2);
 
 % One global displacement/load, duplicated into each partition's local DOFs.
 % Three consecutive DOFs belong to each node: [ux uy uz].

@@ -55,14 +55,22 @@ struct singleGPUData
 
 static void initializeGPUData(const mxArray* hierarchyMx, const mxArray* bMx, const mxArray* yMx, const size_t numGPUs, std::vector<singleGPUData>& gpuData)
 {
-    if (hierarchyMx == nullptr ||
-        !mxIsStruct(hierarchyMx) ||
-        mxGetNumberOfElements(hierarchyMx) != numGPUs)
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:hierarchy",
-            "H must be a MATLAB struct array with numGPUs elements.");
-    }
+    #define REQUIRE_FIELD(ptr, name)                                      \
+        if (!(ptr)) {                                                     \
+            mexErrMsgIdAndTxt(                                            \
+                "mgpu:missingField",                                      \
+                "H(%d).%s is missing.",                                   \
+                static_cast<int>(i + 1), name);                           \
+        }
+
+    REQUIRE_FIELD(numNodesMx, "numNodes");
+    REQUIRE_FIELD(numElementsMx, "numElements");
+    REQUIRE_FIELD(nodeToElementsMx, "nodeToElements");
+    REQUIRE_FIELD(eNodMatMx, "eNodMat");
+    REQUIRE_FIELD(eleModulusMx, "eleModulus");
+    REQUIRE_FIELD(sharedNodesCell, "sharedNodesLocal");
+
+    #undef REQUIRE_FIELD
     if (!mxIsDouble(bMx) ||mxIsComplex(bMx) ||!mxIsDouble(yMx) ||mxIsComplex(yMx))
     {
         mexErrMsgIdAndTxt(

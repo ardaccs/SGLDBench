@@ -425,7 +425,7 @@ U0 = full(double(U0(:)));
 fprintf('issparse(F_) = %d\n', issparse(F_));
 fprintf('issparse(U0) = %d\n', issparse(U0));
 
-H = Build_GPU_Hierarchy_MGPU();
+H = Build_GPU_Hierarchy_MGPU(mesh, 2);
 tGPU = tic;
 [Y, r] = Solving_KbyU_MatrixFree_MGPU( ...
     H, F_, U0, mesh.Ke, numGPUs);

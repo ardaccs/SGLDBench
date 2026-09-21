@@ -472,6 +472,14 @@ fprintf('[PASS] Output dimensions, finiteness and residual.\n');
 % The MEX returns one local vector per partition, with shared-node sums
 % copied into BOTH local vectors. Check all interface DOFs.
 offset2 = 3 * double(P{1}.numNodes);
+% Shared nodes in local GPU numbering
+sharedLocal1 = H(1).sharedNodesLocal{2};
+sharedLocal2 = H(2).sharedNodesLocal{1};
+
+% Corresponding global node IDs
+sharedGlobal = intersect( ...
+    P{1}.globalNodeIds, ...
+    P{2}.globalNodeIds);
 interfaceDOF1 = reshape(3*double(sharedLocal1(:)).' + [-2;-1;0], [], 1);
 interfaceDOF2 = offset2 + reshape(3*double(sharedLocal2(:)).' + [-2;-1;0], [], 1);
 interfaceError = max(abs(Y(interfaceDOF1) - Y(interfaceDOF2)));

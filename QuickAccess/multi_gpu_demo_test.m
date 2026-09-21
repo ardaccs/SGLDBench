@@ -475,7 +475,7 @@ offset2 = 3 * double(P{1}.numNodes);
 % Shared nodes in local GPU numbering
 sharedLocal1 = H(1).sharedNodesLocal{2};
 sharedLocal2 = H(2).sharedNodesLocal{1};
-
+KeTest = mesh.Ke;
 % Corresponding global node IDs
 sharedGlobal = intersect( ...
     P{1}.globalNodeIds, ...

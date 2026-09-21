@@ -77,7 +77,6 @@ static void initializeGPUData(const mxArray* hierarchyMx, const mxArray* bMx, co
         mexErrMsgIdAndTxt(
             "mgpu:devices",
             "Not enough CUDA devices available.");
-        return 1;
     }
 
     gpuData.resize(numGPUs);

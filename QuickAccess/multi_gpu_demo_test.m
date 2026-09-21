@@ -413,46 +413,22 @@ assert(exist('Solving_KbyU_MatrixFree_MGPU', 'file') == 3, ...
     'Compile Solving_KbyU_MatrixFree_MGPU.cu with mexcuda and add its output folder to the MATLAB path.');
 
 % Use the EXACT 24x24 stiffness matrix used by Solving_AssembleFEAstencil.
-% If your project uses a different variable/field name, set KeTest here.
-KeTest = [];
-if isfield(mesh, 'Ke'),          KeTest = mesh.Ke;
-elseif isfield(mesh, 'Ke_'),     KeTest = mesh.Ke_;
-elseif exist('Ke_', 'var'),      KeTest = Ke_;
-elseif exist('Ke', 'var'),       KeTest = Ke;
-elseif exist('KE_', 'var'),      KeTest = KE_;
-elseif exist('KE', 'var'),       KeTest = KE;
-end
-assert(isa(KeTest, 'double') && isreal(KeTest) && ...
-       ~issparse(KeTest) && isequal(size(KeTest), [24,24]), ...
-       ['Cannot locate the 24x24 double element stiffness matrix. ' ...
-        'Set KeTest to the Ke used in Solving_AssembleFEAstencil.']);
-assert(numel(mesh.eleModulus) == mesh.numElements, ...
-    'Global eleModulus must have one entry per active element.');
-
-H = Build_GPU_Hierarchy_MGPU(mesh, 2);
-
-% One global displacement/load, duplicated into each partition's local DOFs.
-% Three consecutive DOFs belong to each node: [ux uy uz].
-nGlobalDOFs = 3 * double(mesh.numNodes);
-idxGlobal = (1:nGlobalDOFs)';
-uGlobal = sin(idxGlobal * 0.013);
-bGlobal = cos(idxGlobal * 0.017);
-clear idxGlobal
-localDOF = cell(1, numGPUs);
-for g = 1:numGPUs
-    nodeIDs = double(P{g}.globalNodeIds(:));
-    localDOF{g} = reshape(3*nodeIDs.' + [-2;-1;0], [], 1);
-end
-y0 = [uGlobal(localDOF{1}); uGlobal(localDOF{2})];
-b  = [bGlobal(localDOF{1}); bGlobal(localDOF{2})];
-clear uGlobal bGlobal
+% If your project uses a different variable/field name, set KeTest here
 
 fprintf('\n========================================\n');
 fprintf(' TESTING TWO-GPU MATRIX-VECTOR PRODUCT\n');
 fprintf('========================================\n');
+
+U0 = zeros(size(F_), 'double');
+F_ = full(double(F_(:)));
+U0 = full(double(U0(:)));
+fprintf('issparse(F_) = %d\n', issparse(F_));
+fprintf('issparse(U0) = %d\n', issparse(U0));
+
+H = Build_GPU_Hierarchy_MGPU();
 tGPU = tic;
 [Y, r] = Solving_KbyU_MatrixFree_MGPU( ...
-    H(1), b, y0, KeTest, numGPUs);
+    H, F_, U0, mesh.Ke, numGPUs);
 fprintf('MEX elapsed time (includes allocation/transfers): %.3f s\n', toc(tGPU));
 assert(isequal(size(Y), size(y0)) && isequal(size(r), size(b)), ...
        'MEX output dimensions are incorrect.');

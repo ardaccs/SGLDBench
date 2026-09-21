@@ -55,11 +55,13 @@ struct singleGPUData
 
 static void initializeGPUData(const mxArray* hierarchyMx, const mxArray* bMx, const mxArray* yMx, const size_t numGPUs, std::vector<singleGPUData>& gpuData)
 {
-    if (hierarchyMx == nullptr ||!mxIsStruct(hierarchyMx) ||mxGetNumberOfElements(hierarchyMx) != 1)
+    if (hierarchyMx == nullptr ||
+        !mxIsStruct(hierarchyMx) ||
+        mxGetNumberOfElements(hierarchyMx) != numGPUs)
     {
         mexErrMsgIdAndTxt(
             "mgpcg_gpu:hierarchy",
-            "H must be a scalar MATLAB struct.");
+            "H must be a MATLAB struct array with numGPUs elements.");
     }
     if (!mxIsDouble(bMx) ||mxIsComplex(bMx) ||!mxIsDouble(yMx) ||mxIsComplex(yMx))
     {

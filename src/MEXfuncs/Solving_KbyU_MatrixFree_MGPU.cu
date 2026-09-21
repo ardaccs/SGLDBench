@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <climits>
 #include <cstdio>
+#include <vector>
+
 
 // Elementary stiffness matrix (4.6 kB)
 __constant__ double c_Ke[24 * 24];

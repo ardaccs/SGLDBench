@@ -405,12 +405,12 @@ fprintf(' ALL PARTITION SANITY CHECKS PASSED\n');
 fprintf('========================================\n\n');
 
 %% 17. MULTI-GPU K*U TEST (append after partition sanity checks)
-% Compile separately, from the folder containing mgpu_kbyu.cu:
-%   mexcuda -output mgpu_kbyu mgpu_kbyu.cu
+% Compile separately, from the folder containing Solving_KbyU_MatrixFree_MGPU.cu:
+%   mexcuda -output Solving_KbyU_MatrixFree_MGPU Solving_KbyU_MatrixFree_MGPU.cu
 % This test uses the existing mesh and partitions; it does not rebuild them.
 assert(numGPUs == 2, 'This MEX currently supports exactly two GPUs.');
-assert(exist('mgpu_kbyu', 'file') == 3, ...
-    'Compile mgpu_kbyu.cu with mexcuda and add its output folder to the MATLAB path.');
+assert(exist('Solving_KbyU_MatrixFree_MGPU', 'file') == 3, ...
+    'Compile Solving_KbyU_MatrixFree_MGPU.cu with mexcuda and add its output folder to the MATLAB path.');
 
 % Use the EXACT 24x24 stiffness matrix used by Solving_AssembleFEAstencil.
 % If your project uses a different variable/field name, set KeTest here.
@@ -472,7 +472,7 @@ fprintf('\n========================================\n');
 fprintf(' TESTING TWO-GPU MATRIX-VECTOR PRODUCT\n');
 fprintf('========================================\n');
 tGPU = tic;
-[Y, r] = mgpu_kbyu(H, b, y0, KeTest, numGPUs);
+[Y, r] = Solving_KbyU_MatrixFree_MGPU(H, b, y0, KeTest, numGPUs);
 fprintf('MEX elapsed time (includes allocation/transfers): %.3f s\n', toc(tGPU));
 assert(isequal(size(Y), size(y0)) && isequal(size(r), size(b)), ...
        'MEX output dimensions are incorrect.');

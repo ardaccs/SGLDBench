@@ -419,17 +419,47 @@ fprintf('\n========================================\n');
 fprintf(' TESTING TWO-GPU MATRIX-VECTOR PRODUCT\n');
 fprintf('========================================\n');
 
-U0 = zeros(size(F_), 'double');
-F_ = full(double(F_(:)));
-U0 = full(double(U0(:)));
-fprintf('issparse(F_) = %d\n', issparse(F_));
-fprintf('issparse(U0) = %d\n', issparse(U0));
+% Global displacement test vector
+rng(42);
+Uglobal = randn(3 * double(mesh.numNodes), 1);
 
-H = Build_GPU_Hierarchy_MGPU(mesh, 2);
+Fglobal = full(double(F_(:)));
+
+% Construct GPU-local vectors
+b = [];
+y0 = [];
+
+for g = 1:numGPUs
+
+    globalNodes = double(P{g}.globalNodeIds(:));
+
+    % Global DOF IDs corresponding to local nodes
+    globalDOFs = reshape( ...
+        3 * globalNodes.' + [-2; -1; 0], [], 1);
+
+    b = [b; Fglobal(globalDOFs)];
+    y0 = [y0; Uglobal(globalDOFs)];
+
+end
+
+% Build GPU hierarchy
+H = Build_GPU_Hierarchy_MGPU(mesh, numGPUs);
+
+assert(isstruct(H));
+assert(numel(H) == numGPUs);
+
+expectedDOFs = 3 * sum(double([H.numNodes]));
+
+assert(numel(b) == expectedDOFs);
+assert(numel(y0) == expectedDOFs);
+
+% Execute GPU matrix-vector multiplication
 tGPU = tic;
+
 [Y, r] = Solving_KbyU_MatrixFree_MGPU( ...
-    H, F_, U0, mesh.Ke, numGPUs);
-fprintf('MEX elapsed time (includes allocation/transfers): %.3f s\n', toc(tGPU));
+    H, b, y0, mesh.Ke, numGPUs);
+
+fprintf('MEX elapsed time: %.3f s\n', toc(tGPU));
 assert(isequal(size(Y), size(y0)) && isequal(size(r), size(b)), ...
        'MEX output dimensions are incorrect.');
 assert(all(isfinite(Y)) && all(isfinite(r)), ...

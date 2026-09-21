@@ -1,4 +1,4 @@
-function FEA_SetupVoxelBased()
+function FEA_SetupVoxelBased(numGPUs)
 	global meshHierarchy_;
 	global numLevels_;
 	
@@ -7,7 +7,11 @@ function FEA_SetupVoxelBased()
 	
 	%%2. Initialize Solver
 	%% Building Mesh Hierarchy for Geometric Multi-grid Solver
-	Solving_BuildingMeshHierarchy();
+	if numGPUs>1
+		Solving_BuildingMeshHierarchy_MGPU();
+	else
+		Solving_BuildingMeshHierarchy();
+	end
 		
 	%% Transfer Boundary Condition to Coaser Levels
 	fixedDOFsOnFiner = zeros(meshHierarchy_(1).numDOFs,1);

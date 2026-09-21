@@ -32,6 +32,7 @@ __constant__ double c_Ke[24 * 24];
         mexEvalString("drawnow;");                                           \
     } while (0)
 
+
 // One Levelrepresents one of these:Level 0 → meshHierarchy_(1), Level 1 → meshHierarchy_(2)
 struct Level
 {
@@ -1311,6 +1312,7 @@ static void applyVcycle(
         cudaMemcpyDeviceToDevice));
 }
         */
+__global__ void
 static void applyVcycle(
     SolverContext& solver,
     const double* d_fineResidual,

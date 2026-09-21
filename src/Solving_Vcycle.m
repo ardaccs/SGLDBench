@@ -39,7 +39,7 @@ function rTilde = Solving_Vcycle(r)
 			
 			%%3.2 apply for smoother
 			rTilde = rTilde + weightFactorJacobi_ * r ./ meshHierarchy_(ii-1).diagK;
-		else
+		else	
 			%%3.1. interpolation			
 			varVcycle(ii-1).x = varVcycle(ii-1).x + Solving_InterpolationDeviation(varVcycle(ii).x,ii);
 			

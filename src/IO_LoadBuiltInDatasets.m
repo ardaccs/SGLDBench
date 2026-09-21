@@ -1,4 +1,4 @@
-function IO_LoadBuiltInDatasets(MdlSelect, resolution)
+function IO_LoadBuiltInDatasets(MdlSelect, resolution, numGPUs)
 	global loadingCond_;
 	global fixingCond_;
 	%% !!!
@@ -7,16 +7,30 @@ function IO_LoadBuiltInDatasets(MdlSelect, resolution)
 	switch MdlSelect
 		case 'Bone'
 			IO_ImportSurfaceMesh('../data/Bone.ply');
-			if resolution == 512
+			if resolution == 512 && numGPUs == 1
 				FEA_CreateVoxelizedModel(512);
 				FEA_VoxelBasedDiscretization();
 
 				loadingCond_ = load('../data/Bone_R512_loads.bc');
 				fixingCond_ = load('../data/Bone_R512_fixa.bc');
 
-			elseif resolution == 1200
+			elseif resolution == 1200 && numGPUs == 1
 				FEA_CreateVoxelizedModel(1200);
 				FEA_VoxelBasedDiscretization();
+
+				loadingCond_ = load('../data/Bone_R1200_loads.bc');
+
+				fixingCond_ = load('../data/Bone_R1200_fixa.bc');
+			elseif resolution == 512 && numGPUs > 1
+				FEA_CreateVoxelizedModel(512);
+				FEA_VoxelBasedDiscretization_MGPU(numGPUs);
+
+				loadingCond_ = load('../data/Bone_R512_loads.bc');
+
+				fixingCond_ = load('../data/Bone_R512_fixa.bc');
+			elseif resolution == 1200 && numGPUs > 1
+				FEA_CreateVoxelizedModel(1200);
+				FEA_VoxelBasedDiscretization_MGPU(numGPUs);
 
 				loadingCond_ = load('../data/Bone_R1200_loads.bc');
 

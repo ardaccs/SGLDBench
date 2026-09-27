@@ -144,8 +144,8 @@ function FEA_VoxelBasedDiscretization_MGPU(numGPUs)
 
     % Store the finest-level decomposition so every coarser level can
     % project exactly the same partition boundaries.
-    meshHierarchy_.partitionSplitAxis = int32(splitAxis);
-    meshHierarchy_.partitionEdges = int32(edges);
+    %meshHierarchy_.partitionSplitAxis = int32(splitAxis);
+    %meshHierarchy_.partitionEdges = int32(edges);
 
     meshHierarchy_.partitions = cell(numGPUs,1);
 

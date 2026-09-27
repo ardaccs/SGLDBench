@@ -35,33 +35,7 @@ disp(['Assemble Computing Stencil Costs: ', sprintf('%10.3g',toc(tStart)) 's']);
 
 %% 4. Multiple GPU Implementation
 
-%% Get the longest axis of the mesh
 
-assert(isfield(meshHierarchy_(1), 'partitionSplitAxis'), ...
-    'meshHierarchy_(1).partitionSplitAxis is missing.');
-
-splitAxis = double(meshHierarchy_(1).partitionSplitAxis);
-
-axisNames = {'X', 'Y', 'Z'};
-dims = [ ...
-    meshHierarchy_(1).resX, ...
-    meshHierarchy_(1).resY, ...
-    meshHierarchy_(1).resZ];
-
-fprintf('\nPartition split axis: %s = %g\n', ...
-    axisNames{splitAxis}, ...
-    dims(splitAxis));
-
-%% Split the mesh along the longest axis
-
-assert(isfield(meshHierarchy_(1), 'partitionEdges'), ...
-    'meshHierarchy_(1).partitionEdges is missing.');
-
-edges = double(meshHierarchy_(1).partitionEdges);
-
-fprintf('Partition edges: ');
-fprintf('%d ', edges);
-fprintf('\n');
 
 
 %% ------------------------------------------------------------

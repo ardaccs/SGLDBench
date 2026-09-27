@@ -114,198 +114,488 @@ function FEA_VoxelBasedDiscretization_MGPU(numGPUs)
     end
 
     % Guarantee strictly increasing boundaries so every GPU owns at least
+
     % one geometric slab. First push cuts forward, then backward if needed.
+
     for g = 2:numGPUs
+
         edges(g) = max(edges(g), edges(g-1) + 1);
+
     end
+
+
 
     for g = numGPUs:-1:2
+
         edges(g) = min(edges(g), edges(g+1) - 1);
+
     end
 
+
+
     edges(1) = 0;
+
     edges(end) = axisLength;
 
+
+
     assert(all(diff(edges) > 0), ...
-        'Unable to create non-empty GPU slabs.');    meshHierarchy_.partitions = cell(numGPUs,1);
+        'Unable to create non-empty GPU slabs.');
+
+    % Store the finest-level decomposition so every coarser level can
+    % project exactly the same partition boundaries.
+    meshHierarchy_.partitionSplitAxis = int32(splitAxis);
+    meshHierarchy_.partitionEdges = int32(edges);
+
+    meshHierarchy_.partitions = cell(numGPUs,1);
+
+    fprintf('\nBalanced finest-level partitioning:\n');
+    fprintf('  split axis: %d  (1=X, 2=Y, 3=Z)\n', splitAxis);
+    fprintf('  edges: ');
+    fprintf('%d ', edges);
+    fprintf('\n');
+
     for i = 1:numGPUs
 
+
+
         lower = edges(i) + 1;
+
         upper = edges(i+1);
 
+
+
         if splitAxis == 1
+
             mask = xEle >= lower & xEle <= upper;
 
+
+
         elseif splitAxis == 2
+
             mask = yEle >= lower & yEle <= upper;
 
+
+
         else
+
             mask = zEle >= lower & zEle <= upper;
+
         end
 
+
+
         % Active element IDs that are part of this partition
+
         elementIds = find(mask);
+
         meshHierarchy_.partitions{i}.elementIds = int32(elementIds);
         meshHierarchy_.partitions{i}.numElements = numel(elementIds);
         meshHierarchy_.partitions{i}.range = int32([lower upper]);
+        meshHierarchy_.partitions{i}.splitAxis = int32(splitAxis);
+
+
 
         % Global element IDs that are part of this partition. So partition.eleMapBack contains their actual voxel grid positions.
-        meshHierarchy_.partitions{i}.eleMapBack = globalEleMapBack(elementIds);
-    end
-	%%5. discretize
-	nodenrs = reshape(1:(nx+1)*(ny+1)*(nz+1), 1+ny, 1+nx, 1+nz); nodenrs = int32(nodenrs);
-	eNodVec = reshape(nodenrs(1:end-1,1:end-1,1:end-1)+1, nx*ny*nz, 1);
-	eNodMatHalfTemp_ = repmat(eNodVec,1,8);
-	eNodMat = repmat(eNodVec(meshHierarchy_.eleMapBack),1,8);	
-	tmp = [0 ny+[1 0] -1 (ny+1)*(nx+1)+[0 ny+[1 0] -1]]; tmp = int32(tmp);
-	for ii=1:8
-		eNodMat(:,ii) = eNodMat(:,ii) + repmat(tmp(ii), meshHierarchy_.numElements,1);
-		eNodMatHalfTemp_(:,ii) = eNodMatHalfTemp_(:,ii) + repmat(tmp(ii), nx*ny*nz,1);	
-	end
-	eNodMatHalfTemp_ = eNodMatHalfTemp_(:,[3 4 7 8]);
-	meshHierarchy_.nodMapBack = unique(eNodMat);
-	meshHierarchy_.numNodes = length(meshHierarchy_.nodMapBack);
-	meshHierarchy_.numDOFs = meshHierarchy_.numNodes*3;
-	meshHierarchy_.nodMapForward = zeros((nx+1)*(ny+1)*(nz+1),1, 'int32');
-	meshHierarchy_.nodMapForward(meshHierarchy_.nodMapBack) = (1:meshHierarchy_.numNodes)';
-	
-	for ii=1:8
-		eNodMat(:,ii) = meshHierarchy_.nodMapForward(eNodMat(:,ii));
-	end	
 
-	%% Build GPU-local connectivity
+        meshHierarchy_.partitions{i}.eleMapBack = globalEleMapBack(elementIds);
+
+    end
+
+    %%5. discretize
+
+    nodenrs = reshape(1:(nx+1)*(ny+1)*(nz+1), 1+ny, 1+nx, 1+nz); nodenrs = int32(nodenrs);
+
+    eNodVec = reshape(nodenrs(1:end-1,1:end-1,1:end-1)+1, nx*ny*nz, 1);
+
+    eNodMatHalfTemp_ = repmat(eNodVec,1,8);
+
+    eNodMat = repmat(eNodVec(meshHierarchy_.eleMapBack),1,8);   
+
+    tmp = [0 ny+[1 0] -1 (ny+1)*(nx+1)+[0 ny+[1 0] -1]]; tmp = int32(tmp);
+
+    for ii=1:8
+
+        eNodMat(:,ii) = eNodMat(:,ii) + repmat(tmp(ii), meshHierarchy_.numElements,1);
+
+        eNodMatHalfTemp_(:,ii) = eNodMatHalfTemp_(:,ii) + repmat(tmp(ii), nx*ny*nz,1);  
+
+    end
+
+    eNodMatHalfTemp_ = eNodMatHalfTemp_(:,[3 4 7 8]);
+
+    meshHierarchy_.nodMapBack = unique(eNodMat);
+
+    meshHierarchy_.numNodes = length(meshHierarchy_.nodMapBack);
+
+    meshHierarchy_.numDOFs = meshHierarchy_.numNodes*3;
+
+    meshHierarchy_.nodMapForward = zeros((nx+1)*(ny+1)*(nz+1),1, 'int32');
+
+    meshHierarchy_.nodMapForward(meshHierarchy_.nodMapBack) = (1:meshHierarchy_.numNodes)';
+
+    % Full Cartesian-grid node IDs for active finest-level nodes.
+    % Restriction uses these IDs to locate coarse/fine stencil centers.
+    meshHierarchy_.nodGridId = int32(meshHierarchy_.nodMapBack);
+
+    for ii=1:8
+
+        eNodMat(:,ii) = meshHierarchy_.nodMapForward(eNodMat(:,ii));
+
+    end 
+
+
+
+    %% Build GPU-local connectivity
+
     for i = 1:numGPUs
 
+
+
         %% Active element IDs that are part of this partition.
+
         elementIds = meshHierarchy_.partitions{i}.elementIds;
 
+
+
         % Rows belonging to this GPU
+
         eNodMatGlobal = eNodMat(elementIds,:);
 
+
+
         % Global active node IDs needed by this GPU
+
         globalNodeIds = unique(eNodMatGlobal(:));
-        meshHierarchy_.partitions{i}.globalNodeIds = globalNodeIds;
+
+        meshHierarchy_.partitions{i}.globalNodeIds = int32(globalNodeIds);
         meshHierarchy_.partitions{i}.numNodes = numel(globalNodeIds);
+
+        % Local active node -> full Cartesian-grid node ID.
+        % This is the same representation used on coarser MGPU levels.
+        meshHierarchy_.partitions{i}.nodGridId = int32( ...
+            meshHierarchy_.nodGridId(double(globalNodeIds)));
+
+        % Filled below after every partition's globalNodeIds are known.
+        % sharedNodesLocal{j}(k) gives the local node ID on this GPU that
+        % corresponds to the same physical node as GPU j's k-th entry.
+        meshHierarchy_.partitions{i}.sharedNodesLocal = cell(1, numGPUs);
+
+
+
 
 
         globalToLocal = zeros(meshHierarchy_.numNodes,1,'int32');
+
         globalToLocal(globalNodeIds) = int32(1:numel(globalNodeIds));
+
         eNodMatLocal = globalToLocal(eNodMatGlobal);
+
         meshHierarchy_.partitions{i}.eNodMat = eNodMatLocal;
+
+
+
 
 
         %% Build node-to-element mapping for this GPU
 
+
+
         numLocalNodes = numel(globalNodeIds);
+
         numLocalElements = numel(elementIds);
+
         nodeToElements = zeros(numLocalNodes,8,'int32');
+
         nodeToElementsCount = zeros(numLocalNodes,1,'int32');
+
+
 
         for ee = 1:numLocalElements
 
+
+
             for nn = 1:8
+
+
 
                 node = eNodMatLocal(ee,nn);
 
+
+
                 nodeToElementsCount(node) = nodeToElementsCount(node) + 1;
+
+
 
                 slot = nodeToElementsCount(node);
 
+
+
                 if slot > 8
+
                     error('Node touches more than 8 elements.');
+
                 end
 
+
+
                 nodeToElements(node,slot) = ee;
+
             end
+
         end
+
         meshHierarchy_.partitions{i}.nodeToElements = nodeToElements;
 
     end
-	%%6. identify boundary info.	
-	meshHierarchy_.numNod2ElesVec = zeros(meshHierarchy_.numNodes,1);
-	for jj=1:8
-		iNodes = eNodMat(:,jj);
-		meshHierarchy_.numNod2ElesVec(iNodes) = meshHierarchy_.numNod2ElesVec(iNodes) + 1;
-	end	
 
-	meshHierarchy_.nodesOnBoundary = find(meshHierarchy_.numNod2ElesVec<8);
-	meshHierarchy_.nodesOnBoundary = int32(meshHierarchy_.nodesOnBoundary);
-	allNodes = zeros(meshHierarchy_.numNodes,1,'int32');
-	allNodes(meshHierarchy_.nodesOnBoundary) = 1;	
-	tmp = zeros(meshHierarchy_.numElements,1,'int32');
-	for ii=1:8
-		tmp = tmp + allNodes(eNodMat(:,ii));
-	end
-	meshHierarchy_.elementsOnBoundary = int32(find(tmp>0));
-	blockIndex = Solving_MissionPartition(meshHierarchy_.numElements, 5.0e6);
-	for ii=1:size(blockIndex,1)				
-		rangeIndex = (blockIndex(ii,1):blockIndex(ii,2))';
-		patchIndices = eNodMat(rangeIndex, [4 3 2 1  5 6 7 8  1 2 6 5  8 7 3 4  5 8 4 1  2 3 7 6])';
-		patchIndices = reshape(patchIndices(:), 4, 6*numel(rangeIndex));
-		tmp = zeros(meshHierarchy_.numNodes, 1);
-		tmp(meshHierarchy_.nodesOnBoundary) = 1;
-		tmp = tmp(patchIndices); tmp = sum(tmp,1);
-		iBoundaryEleFaces = patchIndices(:,find(4==tmp));
-		meshHierarchy_.boundaryEleFaces(end+1:end+size(iBoundaryEleFaces,2),:) = iBoundaryEleFaces';
-	end
-	allNodes(meshHierarchy_.nodesOnBoundary) = (1:numel(meshHierarchy_.nodesOnBoundary))';
-	meshHierarchy_.boundaryEleFaces = allNodes(meshHierarchy_.boundaryEleFaces);
+    %% ------------------------------------------------------------
+    %% Build pairwise shared/interface-node mappings
+    %% ------------------------------------------------------------
+    %
+    % These mappings are useful for:
+    %   1) K*U interface reduction
+    %   2) fine-residual halo exchange used by restriction
+    %
+    % Only LOCAL node IDs are stored. Global IDs are used temporarily
+    % here to establish correspondence.
 
-	%%% TODO.CHECK
-	nodeToElements = zeros(meshHierarchy_(1).numNodes, 8, 'int32');
-	nodeToElementsCount = zeros(meshHierarchy_(1).numNodes, 1, 'int32');
+    for g1 = 1:numGPUs
+        for g2 = g1+1:numGPUs
 
-	for ee = 1:meshHierarchy_(1).numElements
-		for nn = 1:8
-			iNode = eNodMat(ee, nn);
-			nodeToElementsCount(iNode) = nodeToElementsCount(iNode) + 1;
-			slot = nodeToElementsCount(iNode);
+            globalNodes1 = meshHierarchy_.partitions{g1}.globalNodeIds;
+            globalNodes2 = meshHierarchy_.partitions{g2}.globalNodeIds;
 
-			if slot <= 8
-				nodeToElements(iNode, slot) = ee;
-			else
-				error('Node touches more than 8 active elements.');
-			end
-		end
-	end
-	meshHierarchy_(1).nodeToElements = nodeToElements;
-	meshHierarchy_(1).nodGridId = int32(meshHierarchy_(1).nodMapBack);
+            sharedGlobalNodes = intersect(globalNodes1, globalNodes2);
 
-	%%7. 
-	% nodeCoords_ = zeros((nx+1)*(ny+1)*(nz+1),3);
-	xSeed = boundingBox_(1,1):(boundingBox_(2,1)-boundingBox_(1,1))/nx:boundingBox_(2,1); xSeed = single(xSeed);
-	ySeed = boundingBox_(2,2):(boundingBox_(1,2)-boundingBox_(2,2))/ny:boundingBox_(1,2); ySeed = single(ySeed);
-	zSeed = boundingBox_(1,3):(boundingBox_(2,3)-boundingBox_(1,3))/nz:boundingBox_(2,3); zSeed = single(zSeed);	
-	eleCentroidList = zeros(meshHierarchy_.numElements,3, 'single');
-	meshHierarchy_.boundaryNodeCoords = zeros(numel(meshHierarchy_(1).nodesOnBoundary),3, 'single');
-	tmp = repmat(reshape(repmat(xSeed,ny+1,1), (nx+1)*(ny+1), 1), (nz+1), 1); tmp = tmp(meshHierarchy_.nodMapBack,1); %%Node Coords in X
-	niftiwrite(tmp, strcat(outPath_, 'cache_coordX.nii'));
-	meshHierarchy_.boundaryNodeCoords(:,1) = tmp(meshHierarchy_(1).nodesOnBoundary,1);
-	for ii=1:size(blockIndex,1)	
-		iSelEleNodes = eNodMat(blockIndex(ii,1):blockIndex(ii,2),:);
-		eleCentX = tmp(iSelEleNodes);
-		eleCentroidList(blockIndex(ii,1):blockIndex(ii,2),1) = sum(eleCentX,2)/8;
-	end
-	tmp = repmat(repmat(ySeed,1,nx+1)', (nz+1), 1); tmp = tmp(meshHierarchy_.nodMapBack,1); %%Node Coords in Y
-	niftiwrite(tmp, strcat(outPath_, 'cache_coordY.nii'));
-	meshHierarchy_.boundaryNodeCoords(:,2) = tmp(meshHierarchy_(1).nodesOnBoundary,1);
-	for ii=1:size(blockIndex,1)	
-		iSelEleNodes = eNodMat(blockIndex(ii,1):blockIndex(ii,2),:);
-		eleCentY = tmp(iSelEleNodes);
-		eleCentroidList(blockIndex(ii,1):blockIndex(ii,2),2) = sum(eleCentY,2)/8;
-	end	
-	tmp = reshape(repmat(zSeed,(nx+1)*(ny+1),1), (nx+1)*(ny+1)*(nz+1), 1); tmp = tmp(meshHierarchy_.nodMapBack,1); %Node Coords in Z
-	niftiwrite(tmp, strcat(outPath_, 'cache_coordZ.nii'));
-	meshHierarchy_.boundaryNodeCoords(:,3) = tmp(meshHierarchy_(1).nodesOnBoundary,1);
-	for ii=1:size(blockIndex,1)	
-		iSelEleNodes = eNodMat(blockIndex(ii,1):blockIndex(ii,2),:);
-		eleCentZ = tmp(iSelEleNodes);
-		eleCentroidList(blockIndex(ii,1):blockIndex(ii,2),3) = sum(eleCentZ,2)/8;
-	end
-	% meshHierarchy_.eNodMatHalf = eNodMat(:,[3 4 7 8]);
-	meshHierarchy_.eNodMat = eNodMat;
-	meshHierarchy_.state = 1;
-	
-	niftiwrite(eleCentroidList, strcat(outPath_, 'cache_eleCentroidList.nii'));
-	% boundingBox_ = [min(meshHierarchy_.boundaryNodeCoords,[],1); max(meshHierarchy_.boundaryNodeCoords,[],1)];
+            [~, localNodes1] = ismember(sharedGlobalNodes, globalNodes1);
+            [~, localNodes2] = ismember(sharedGlobalNodes, globalNodes2);
+
+            meshHierarchy_.partitions{g1}.sharedNodesLocal{g2} = ...
+                int32(localNodes1(:));
+
+            meshHierarchy_.partitions{g2}.sharedNodesLocal{g1} = ...
+                int32(localNodes2(:));
+
+            assert(numel(localNodes1) == numel(localNodes2), ...
+                'Shared-node mapping size mismatch between GPU %d and GPU %d.', ...
+                g1-1, g2-1);
+
+            if ~isempty(sharedGlobalNodes)
+                check1 = globalNodes1(double(localNodes1));
+                check2 = globalNodes2(double(localNodes2));
+
+                assert(isequal(int32(check1(:)), int32(check2(:))), ...
+                    'Shared-node mapping mismatch between GPU %d and GPU %d.', ...
+                    g1-1, g2-1);
+            end
+        end
+    end
+
+    %% ------------------------------------------------------------
+    %% Partition sanity / load-balance report
+    %% ------------------------------------------------------------
+
+    totalPartitionElements = 0;
+
+    for i = 1:numGPUs
+        P = meshHierarchy_.partitions{i};
+
+        totalPartitionElements = totalPartitionElements + P.numElements;
+
+        fprintf(['  GPU %d: range [%d, %d], elements = %d (%.2f%%), ' ...
+                 'nodes = %d\n'], ...
+            i-1, ...
+            P.range(1), P.range(2), ...
+            P.numElements, ...
+            100.0 * double(P.numElements) / double(meshHierarchy_.numElements), ...
+            P.numNodes);
+
+        assert(numel(P.nodGridId) == P.numNodes, ...
+            'GPU %d: nodGridId size mismatch.', i-1);
+
+        assert(size(P.eNodMat,1) == P.numElements && ...
+               size(P.eNodMat,2) == 8, ...
+            'GPU %d: invalid local eNodMat dimensions.', i-1);
+
+        assert(size(P.nodeToElements,1) == P.numNodes && ...
+               size(P.nodeToElements,2) == 8, ...
+            'GPU %d: invalid local nodeToElements dimensions.', i-1);
+    end
+
+    assert(totalPartitionElements == meshHierarchy_.numElements, ...
+        'Partition element counts do not reproduce the global active mesh.');
+
+    %%6. identify boundary info.    
+
+    meshHierarchy_.numNod2ElesVec = zeros(meshHierarchy_.numNodes,1);
+
+    for jj=1:8
+
+        iNodes = eNodMat(:,jj);
+
+        meshHierarchy_.numNod2ElesVec(iNodes) = meshHierarchy_.numNod2ElesVec(iNodes) + 1;
+
+    end 
+
+
+
+    meshHierarchy_.nodesOnBoundary = find(meshHierarchy_.numNod2ElesVec<8);
+
+    meshHierarchy_.nodesOnBoundary = int32(meshHierarchy_.nodesOnBoundary);
+
+    allNodes = zeros(meshHierarchy_.numNodes,1,'int32');
+
+    allNodes(meshHierarchy_.nodesOnBoundary) = 1;   
+
+    tmp = zeros(meshHierarchy_.numElements,1,'int32');
+
+    for ii=1:8
+
+        tmp = tmp + allNodes(eNodMat(:,ii));
+
+    end
+
+    meshHierarchy_.elementsOnBoundary = int32(find(tmp>0));
+
+    blockIndex = Solving_MissionPartition(meshHierarchy_.numElements, 5.0e6);
+
+    for ii=1:size(blockIndex,1)             
+
+        rangeIndex = (blockIndex(ii,1):blockIndex(ii,2))';
+
+        patchIndices = eNodMat(rangeIndex, [4 3 2 1  5 6 7 8  1 2 6 5  8 7 3 4  5 8 4 1  2 3 7 6])';
+
+        patchIndices = reshape(patchIndices(:), 4, 6*numel(rangeIndex));
+
+        tmp = zeros(meshHierarchy_.numNodes, 1);
+
+        tmp(meshHierarchy_.nodesOnBoundary) = 1;
+
+        tmp = tmp(patchIndices); tmp = sum(tmp,1);
+
+        iBoundaryEleFaces = patchIndices(:,find(4==tmp));
+
+        meshHierarchy_.boundaryEleFaces(end+1:end+size(iBoundaryEleFaces,2),:) = iBoundaryEleFaces';
+
+    end
+
+    allNodes(meshHierarchy_.nodesOnBoundary) = (1:numel(meshHierarchy_.nodesOnBoundary))';
+
+    meshHierarchy_.boundaryEleFaces = allNodes(meshHierarchy_.boundaryEleFaces);
+
+
+
+    %%% TODO.CHECK
+
+    nodeToElements = zeros(meshHierarchy_(1).numNodes, 8, 'int32');
+
+    nodeToElementsCount = zeros(meshHierarchy_(1).numNodes, 1, 'int32');
+
+
+
+    for ee = 1:meshHierarchy_(1).numElements
+
+        for nn = 1:8
+
+            iNode = eNodMat(ee, nn);
+
+            nodeToElementsCount(iNode) = nodeToElementsCount(iNode) + 1;
+
+            slot = nodeToElementsCount(iNode);
+
+
+
+            if slot <= 8
+
+                nodeToElements(iNode, slot) = ee;
+
+            else
+
+                error('Node touches more than 8 active elements.');
+
+            end
+
+        end
+
+    end
+
+    meshHierarchy_(1).nodeToElements = nodeToElements;
+
+
+
+    %%7. 
+
+    % nodeCoords_ = zeros((nx+1)*(ny+1)*(nz+1),3);
+
+    xSeed = boundingBox_(1,1):(boundingBox_(2,1)-boundingBox_(1,1))/nx:boundingBox_(2,1); xSeed = single(xSeed);
+
+    ySeed = boundingBox_(2,2):(boundingBox_(1,2)-boundingBox_(2,2))/ny:boundingBox_(1,2); ySeed = single(ySeed);
+
+    zSeed = boundingBox_(1,3):(boundingBox_(2,3)-boundingBox_(1,3))/nz:boundingBox_(2,3); zSeed = single(zSeed);    
+
+    eleCentroidList = zeros(meshHierarchy_.numElements,3, 'single');
+
+    meshHierarchy_.boundaryNodeCoords = zeros(numel(meshHierarchy_(1).nodesOnBoundary),3, 'single');
+
+    tmp = repmat(reshape(repmat(xSeed,ny+1,1), (nx+1)*(ny+1), 1), (nz+1), 1); tmp = tmp(meshHierarchy_.nodMapBack,1); %%Node Coords in X
+
+    niftiwrite(tmp, strcat(outPath_, 'cache_coordX.nii'));
+
+    meshHierarchy_.boundaryNodeCoords(:,1) = tmp(meshHierarchy_(1).nodesOnBoundary,1);
+
+    for ii=1:size(blockIndex,1) 
+
+        iSelEleNodes = eNodMat(blockIndex(ii,1):blockIndex(ii,2),:);
+
+        eleCentX = tmp(iSelEleNodes);
+
+        eleCentroidList(blockIndex(ii,1):blockIndex(ii,2),1) = sum(eleCentX,2)/8;
+
+    end
+
+    tmp = repmat(repmat(ySeed,1,nx+1)', (nz+1), 1); tmp = tmp(meshHierarchy_.nodMapBack,1); %%Node Coords in Y
+
+    niftiwrite(tmp, strcat(outPath_, 'cache_coordY.nii'));
+
+    meshHierarchy_.boundaryNodeCoords(:,2) = tmp(meshHierarchy_(1).nodesOnBoundary,1);
+
+    for ii=1:size(blockIndex,1) 
+
+        iSelEleNodes = eNodMat(blockIndex(ii,1):blockIndex(ii,2),:);
+
+        eleCentY = tmp(iSelEleNodes);
+
+        eleCentroidList(blockIndex(ii,1):blockIndex(ii,2),2) = sum(eleCentY,2)/8;
+
+    end 
+
+    tmp = reshape(repmat(zSeed,(nx+1)*(ny+1),1), (nx+1)*(ny+1)*(nz+1), 1); tmp = tmp(meshHierarchy_.nodMapBack,1); %Node Coords in Z
+
+    niftiwrite(tmp, strcat(outPath_, 'cache_coordZ.nii'));
+
+    meshHierarchy_.boundaryNodeCoords(:,3) = tmp(meshHierarchy_(1).nodesOnBoundary,1);
+
+    for ii=1:size(blockIndex,1) 
+
+        iSelEleNodes = eNodMat(blockIndex(ii,1):blockIndex(ii,2),:);
+
+        eleCentZ = tmp(iSelEleNodes);
+
+        eleCentroidList(blockIndex(ii,1):blockIndex(ii,2),3) = sum(eleCentZ,2)/8;
+
+    end
+
+    % meshHierarchy_.eNodMatHalf = eNodMat(:,[3 4 7 8]);
+
+    meshHierarchy_.eNodMat = eNodMat;
+
+    meshHierarchy_.state = 1;
+
+
+
+    niftiwrite(eleCentroidList, strcat(outPath_, 'cache_eleCentroidList.nii'));
+
+    % boundingBox_ = [min(meshHierarchy_.boundaryNodeCoords,[],1); max(meshHierarchy_.boundaryNodeCoords,[],1)];
+
 end

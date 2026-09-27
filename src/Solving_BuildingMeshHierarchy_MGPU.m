@@ -598,18 +598,20 @@ function Solving_BuildingMeshHierarchy_MGPU()
 
 
 
-    %%Print Mesh Hierarchy
+	%% Print Mesh Hierarchy
+	disp('Mesh Hierarchy...');
+	disp('             #Resolutions         #Elements       #DOFs');
 
-    disp('Mesh Hierarchy...');
+	for ii = 1:numel(meshHierarchy_)
 
-    disp('             #Resolutions         #Elements   #DOFs');
+		fprintf('...Level %i: %4i x %4i x %4i %11i %11i\n', ...
+			ii, ...
+			meshHierarchy_(ii).resX, ...
+			meshHierarchy_(ii).resY, ...
+			meshHierarchy_(ii).resZ, ...
+			meshHierarchy_(ii).numElements, ...
+			meshHierarchy_(ii).numDOFs);
 
-    for ii=1:numel(meshHierarchy_)
-
-        disp([sprintf('...Level %i', ii), sprintf(': %4i x %4i x %4i', [meshHierarchy_(ii).resX meshHierarchy_(ii).resY ...
-
-            meshHierarchy_(ii).resZ]), sprintf(' %11i', meshHierarchy_(ii).numElements), sprintf(' %11i', meshHierarchy_(ii).numDOFs)]);
-
-    end
+	end
 
 end

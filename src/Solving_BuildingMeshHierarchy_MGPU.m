@@ -196,99 +196,149 @@ function Solving_BuildingMeshHierarchy_MGPU()
 		
 
 
-        %%8. Multi-GPU partitioning for this hierarchy level
-        % Use the same number of GPUs already used to partition the finest level.
-        %
-        % Besides the KbyU partition data, this section also builds everything
-        % needed to perform restriction from level (ii-1) -> level ii without
-        % creating a second hierarchy structure:
-        %
-        %   partition.nodGridId
-        %       Local coarse node -> full coarse Cartesian-grid node ID.
-        %
-        %   partition.restrictionFineNodeIds
-        %       Active fine-level node IDs required by this GPU's restriction
-        %       stencil. This includes the local fine nodes plus the halo.
-        %
-        %   partition.restrictionFineNodeMapForward
-        %       LOCAL slab-grid ID -> local index in restrictionFineNodeIds.
-        %       0 means an inactive fine-grid node.
-        %
-        %   partition.restrictionFineGridStart
-        %       [x0 y0 z0], 0-based offset of the local fine slab in the full
-        %       fine Cartesian node grid. Only the split axis is cropped.
-        %
-        %   partition.restrictionRecvSourceLocal{srcGPU}
-        %       Fine-partition local node IDs to gather from source GPU.
-        %
-        %   partition.restrictionRecvDestLocal{srcGPU}
-        %       Destination local node IDs in the restriction input buffer.
-        %
-        % A node already present in this GPU's fine partition is always sourced
-        % locally. Only true halo nodes are assigned to another GPU.
+			%% ============================================================
+			%% 8. Multi-GPU partitioning
+			%% ============================================================
 
-        if isfield(meshHierarchy_(1), 'partitions') && ~isempty(meshHierarchy_(1).partitions)
+			if isfield(meshHierarchy_(1), 'partitions') && ...
+					~isempty(meshHierarchy_(1).partitions)
 
-            numGPUs = numel(meshHierarchy_(1).partitions);
+				numGPUs = numel(meshHierarchy_(1).partitions);
 
-			%% Balanced slab partitioning for arbitrary numGPUs
+				%% --------------------------------------------------------
+				% Determine split axis from finest level
+				%% --------------------------------------------------------
 
-			mesh = meshHierarchy_(1);
+				finest = meshHierarchy_(1);
 
-			dims = [mesh.resX, mesh.resY, mesh.resZ];
-			[~, splitAxis] = max(dims);
+				finestDims = [ ...
+					finest.resX, ...
+					finest.resY, ...
+					finest.resZ];
 
-			[iy, ix, iz] = ind2sub( ...
-				[mesh.resY, mesh.resX, mesh.resZ], ...
-				double(mesh.eleMapBack));
+				[~, splitAxis] = max(finestDims);
 
-			switch splitAxis
+				finestAxisLength = finestDims(splitAxis);
 
-				case 1
-					eleCoord = ix;
-					axisLength = mesh.resX;
+				%% --------------------------------------------------------
+				% Build balanced finest-level cuts from active element count
+				%% --------------------------------------------------------
 
-				case 2
-					eleCoord = iy;
-					axisLength = mesh.resY;
+				[fineIy, fineIx, fineIz] = ind2sub( ...
+					[finest.resY, finest.resX, finest.resZ], ...
+					double(finest.eleMapBack));
 
-				case 3
-					eleCoord = iz;
-					axisLength = mesh.resZ;
+				switch splitAxis
+					case 1
+						finestEleCoord = fineIx;
 
-			end
+					case 2
+						finestEleCoord = fineIy;
 
-			% Number of active elements in each coordinate slab
-			counts = accumarray( ...
-				eleCoord(:), ...
-				1, ...
-				[axisLength, 1]);
+					case 3
+						finestEleCoord = fineIz;
+				end
 
-			cumulativeCounts = cumsum(counts);
+				counts = accumarray( ...
+					finestEleCoord(:), ...
+					1, ...
+					[finestAxisLength, 1]);
 
-			totalElements = mesh.numElements;
+				cumulativeCounts = cumsum(counts);
 
-			edges = zeros(1, numGPUs + 1);
+				finestEdges = zeros(1, numGPUs + 1);
 
-			edges(1) = 0;
-			edges(end) = axisLength;
+				finestEdges(1) = 0;
+				finestEdges(end) = finestAxisLength;
 
-			for g = 1:numGPUs-1
+				for g = 1:numGPUs-1
 
-				targetCount = ...
-					g * totalElements / numGPUs;
+					targetCount = ...
+						g * finest.numElements / numGPUs;
 
-				[~, cut] = min( ...
-					abs(cumulativeCounts - targetCount));
+					[~, cut] = min( ...
+						abs(cumulativeCounts - targetCount));
 
-				edges(g+1) = cut;
+					finestEdges(g+1) = cut;
+				end
 
-			end
+				% Ensure strictly increasing partition boundaries
+				for g = 2:numGPUs
+					finestEdges(g) = max( ...
+						finestEdges(g), ...
+						finestEdges(g-1) + 1);
+				end
 
-			fprintf('Balanced partition edges: ');
-			fprintf('%d ', edges);
-			fprintf('\n');
+				for g = numGPUs:-1:2
+					finestEdges(g) = min( ...
+						finestEdges(g), ...
+						finestEdges(g+1) - 1);
+				end
 
+				assert(all(diff(finestEdges) > 0), ...
+					'Could not construct non-empty GPU partitions.');
+
+				fprintf('Finest balanced edges: ');
+				fprintf('%d ', finestEdges);
+				fprintf('\n');
+
+
+				%% --------------------------------------------------------
+				% Project finest partition onto CURRENT hierarchy level
+				%% --------------------------------------------------------
+
+				current = meshHierarchy_(ii);
+
+				currentDims = [ ...
+					current.resX, ...
+					current.resY, ...
+					current.resZ];
+
+				currentAxisLength = currentDims(splitAxis);
+
+				edges = round( ...
+					double(finestEdges) / ...
+					double(finestAxisLength) * ...
+					double(currentAxisLength));
+
+				edges(1) = 0;
+				edges(end) = currentAxisLength;
+
+				% Ensure valid non-empty slabs if possible
+				for g = 2:numGPUs
+					edges(g) = max(edges(g), edges(g-1) + 1);
+				end
+
+				for g = numGPUs:-1:2
+					edges(g) = min(edges(g), edges(g+1) - 1);
+				end
+
+				assert(all(diff(edges) > 0), ...
+					'Level %d is too coarse for %d GPU slabs.', ...
+					ii, numGPUs);
+
+				%% --------------------------------------------------------
+				% IMPORTANT: calculate element coordinates for CURRENT level
+				%% --------------------------------------------------------
+
+				[iy, ix, iz] = ind2sub( ...
+					[current.resY, current.resX, current.resZ], ...
+					double(current.eleMapBack));
+
+				switch splitAxis
+					case 1
+						eleCoord = ix;
+
+					case 2
+						eleCoord = iy;
+
+					case 3
+						eleCoord = iz;
+				end
+
+				fprintf('Level %d partition edges: ', ii);
+				fprintf('%d ', edges);
+				fprintf('\n');
             %% ------------------------------------------------------------
             %% 8.1 Build the normal element/node partitions
             %% ------------------------------------------------------------

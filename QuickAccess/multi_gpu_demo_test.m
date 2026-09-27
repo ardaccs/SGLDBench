@@ -37,23 +37,27 @@ disp(['Assemble Computing Stencil Costs: ', sprintf('%10.3g',toc(tStart)) 's']);
 
 %% Get the longest axis of the mesh
 
-resX = meshHierarchy_(1).resX;
-resY = meshHierarchy_(1).resY;
-resZ = meshHierarchy_(1).resZ;
+assert(isfield(meshHierarchy_(1), 'partitionSplitAxis'), ...
+    'meshHierarchy_(1).partitionSplitAxis is missing.');
 
-values = [resX, resY, resZ];
-names = {'resX', 'resY', 'resZ'};
+splitAxis = double(meshHierarchy_(1).partitionSplitAxis);
 
-[maxValue, idx] = max(values);
-maxName = names{idx};
+axisNames = {'X', 'Y', 'Z'};
+dims = [ ...
+    meshHierarchy_(1).resX, ...
+    meshHierarchy_(1).resY, ...
+    meshHierarchy_(1).resZ];
 
-fprintf('\nLongest axis: %s = %g\n', maxName, maxValue);
+fprintf('\nPartition split axis: %s = %g\n', ...
+    axisNames{splitAxis}, ...
+    dims(splitAxis));
 
 %% Split the mesh along the longest axis
 
-numGPUs = 2;
+assert(isfield(meshHierarchy_(1), 'partitionEdges'), ...
+    'meshHierarchy_(1).partitionEdges is missing.');
 
-edges = round(linspace(0, maxValue, numGPUs + 1));
+edges = double(meshHierarchy_(1).partitionEdges);
 
 fprintf('Partition edges: ');
 fprintf('%d ', edges);

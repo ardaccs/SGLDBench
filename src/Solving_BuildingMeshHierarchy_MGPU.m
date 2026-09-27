@@ -231,32 +231,63 @@ function Solving_BuildingMeshHierarchy_MGPU()
 
             numGPUs = numel(meshHierarchy_(1).partitions);
 
-            % Split along the longest axis of this level.
-            dims = [meshHierarchy_(ii).resX, ...
-                    meshHierarchy_(ii).resY, ...
-                    meshHierarchy_(ii).resZ];
+			%% Balanced slab partitioning for arbitrary numGPUs
 
-            [~, splitAxis] = max(dims);
-            edges = round(linspace(0, dims(splitAxis), numGPUs + 1));
+			mesh = meshHierarchy_(1);
 
-            % Coordinates of active elements in the full Cartesian grid.
-            % eleMapBack uses MATLAB ordering: [Y, X, Z].
-            [iy, ix, iz] = ind2sub( ...
-                [meshHierarchy_(ii).resY, ...
-                 meshHierarchy_(ii).resX, ...
-                 meshHierarchy_(ii).resZ], ...
-                double(meshHierarchy_(ii).eleMapBack));
+			dims = [mesh.resX, mesh.resY, mesh.resZ];
+			[~, splitAxis] = max(dims);
 
-            switch splitAxis
-                case 1
-                    eleCoord = ix;
-                case 2
-                    eleCoord = iy;
-                case 3
-                    eleCoord = iz;
-            end
+			[iy, ix, iz] = ind2sub( ...
+				[mesh.resY, mesh.resX, mesh.resZ], ...
+				double(mesh.eleMapBack));
 
-            meshHierarchy_(ii).partitions = cell(numGPUs,1);
+			switch splitAxis
+
+				case 1
+					eleCoord = ix;
+					axisLength = mesh.resX;
+
+				case 2
+					eleCoord = iy;
+					axisLength = mesh.resY;
+
+				case 3
+					eleCoord = iz;
+					axisLength = mesh.resZ;
+
+			end
+
+			% Number of active elements in each coordinate slab
+			counts = accumarray( ...
+				eleCoord(:), ...
+				1, ...
+				[axisLength, 1]);
+
+			cumulativeCounts = cumsum(counts);
+
+			totalElements = mesh.numElements;
+
+			edges = zeros(1, numGPUs + 1);
+
+			edges(1) = 0;
+			edges(end) = axisLength;
+
+			for g = 1:numGPUs-1
+
+				targetCount = ...
+					g * totalElements / numGPUs;
+
+				[~, cut] = min( ...
+					abs(cumulativeCounts - targetCount));
+
+				edges(g+1) = cut;
+
+			end
+
+			fprintf('Balanced partition edges: ');
+			fprintf('%d ', edges);
+			fprintf('\n');
 
             %% ------------------------------------------------------------
             %% 8.1 Build the normal element/node partitions

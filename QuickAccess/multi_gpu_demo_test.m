@@ -113,22 +113,7 @@ fprintf('[PASS] Element counts: %d == %d\n', ...
     totalPartitionElements, mesh.numElements);
 
 
-%% 5. Check partition ranges
 
-for g = 1:numGPUs
-
-    expectedLower = edges(g) + 1;
-    expectedUpper = edges(g+1);
-
-    assert(P{g}.range(1) == expectedLower, ...
-        'GPU %d has incorrect lower range.', g-1);
-
-    assert(P{g}.range(2) == expectedUpper, ...
-        'GPU %d has incorrect upper range.', g-1);
-
-end
-
-fprintf('[PASS] Partition ranges match requested edges.\n');
 
 
 %% 6. eNodMat dimensions

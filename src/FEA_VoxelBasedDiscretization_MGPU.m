@@ -75,8 +75,59 @@ function FEA_VoxelBasedDiscretization_MGPU(numGPUs)
 	meshHierarchy_.colors = Solving_Coloring(meshHierarchy_.eleMapForward, nx, ny, nz);
 	
     %% 4.5 Partition the mesh for multi-GPU processing
-    [yEle, xEle, zEle] = ind2sub( [ny, nx, nz], double(globalEleMapBack));
-    meshHierarchy_.partitions = cell(numGPUs,1);
+    [yEle, xEle, zEle] = ind2sub( ...
+        [ny, nx, nz], ...
+        double(globalEleMapBack));
+
+    switch splitAxis
+        case 1
+            eleCoord = xEle;
+            axisLength = nx;
+        case 2
+            eleCoord = yEle;
+            axisLength = ny;
+        case 3
+            eleCoord = zEle;
+            axisLength = nz;
+        otherwise
+            error('Invalid splitAxis.');
+    end
+
+    % Number of active elements in every one-cell-thick slab.
+    counts = accumarray( ...
+        eleCoord(:), ...
+        1, ...
+        [axisLength, 1]);
+
+    cumulativeCounts = cumsum(counts);
+    totalElements = meshHierarchy_.numElements;
+
+    edges = zeros(1, numGPUs + 1);
+    edges(1) = 0;
+    edges(end) = axisLength;
+
+    % Place internal boundaries near equal fractions of cumulative work.
+    for g = 1:numGPUs-1
+        targetCount = g * totalElements / numGPUs;
+        [~, cut] = min(abs(cumulativeCounts - targetCount));
+        edges(g+1) = cut;
+    end
+
+    % Guarantee strictly increasing boundaries so every GPU owns at least
+    % one geometric slab. First push cuts forward, then backward if needed.
+    for g = 2:numGPUs
+        edges(g) = max(edges(g), edges(g-1) + 1);
+    end
+
+    for g = numGPUs:-1:2
+        edges(g) = min(edges(g), edges(g+1) - 1);
+    end
+
+    edges(1) = 0;
+    edges(end) = axisLength;
+
+    assert(all(diff(edges) > 0), ...
+        'Unable to create non-empty GPU slabs.');    meshHierarchy_.partitions = cell(numGPUs,1);
     for i = 1:numGPUs
 
         lower = edges(i) + 1;

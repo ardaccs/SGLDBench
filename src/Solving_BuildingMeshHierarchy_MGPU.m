@@ -183,9 +183,9 @@ function Solving_BuildingMeshHierarchy_MGPU()
                 % Determine split axis from finest level
                 finest = meshHierarchy_(1);
 
-                finestDims = double([finest.resX, finest.resY, finest.resZ]);
-                splitAxis = double(finest.partitionSplitAxis);
-                finestEdges = double(finest.partitionEdges(:)');
+                finestDims = int32([finest.resX, finest.resY, finest.resZ]);
+                splitAxis = int32(finest.partitionSplitAxis);
+                finestEdges = int32(finest.partitionEdges(:)');
 
                 % Project finest partition onto CURRENT hierarchy level
                 current = meshHierarchy_(ii);

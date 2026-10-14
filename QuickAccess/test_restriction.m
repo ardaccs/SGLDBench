@@ -1,26 +1,43 @@
 %% test_restriction.m
 % Run from the SGLDBench project root.
-clearvars;
-clc;
+%% DEMO: Stress Analysis
+clear all; clc;
+addpath('../');
+addpath('../src/');
+addpath('../src/MEXfuncs/');
+
+Data_GlobalVariables;
+numGPUs = 2;
+outPath_ = '../out/';
+if ~exist(outPath_, 'dir'), mkdir(outPath_); end
+
+%%1. Data Loading
+tStart = tic;
+MdlSelect = 'Bone';
+IO_LoadBuiltInDatasets(MdlSelect, 512, numGPUs);
+disp(['Prepare Voxel Model Costs: ', sprintf('%10.3g',toc(tStart)) 's']);
+
+% figure; view(gca,3);
+% Vis_DrawMesh3D(gca, meshHierarchy_(1).boundaryNodeCoords, meshHierarchy_(1).boundaryEleFaces, 0);
+% Vis_ShowLoadingCondition(gca, loadingCond_);
+% Vis_ShowFixingCondition(gca, fixingCond_);
+
+%% 2. Setup FEA
+tStart = tic;
+FEA_ApplyBoundaryCondition();
+FEA_SetupVoxelBased(numGPUs);
+densityField = ones(meshHierarchy_(1).numElements,1); %%fully solid domain
+meshHierarchy_(1).eleModulus = TopOpti_MaterialInterpolationSIMP(densityField(:));
+disp(['Setup FEA Costs: ', sprintf('%10.3g',toc(tStart)) 's']);
+
+%% 3. Assemble Computing Stencil
+tStart = tic;
+Solving_AssembleFEAstencil();
+disp(['Assemble Computing Stencil Costs: ', sprintf('%10.3g',toc(tStart)) 's']);
 
 addpath(fullfile(pwd, 'QuickAccess'));
 
-% Change this to the MAT-file containing your initialized mesh hierarchy.
-hierarchyFile = fullfile(pwd, 'meshHierarchy.mat');
-assert(isfile(hierarchyFile), ...
-    ['Hierarchy file not found: %s\n' ...
-     'Save meshHierarchy_ from your initialized MATLAB session first.'], ...
-    hierarchyFile);
-
-S = load(hierarchyFile);
-if isfield(S, 'meshHierarchy_')
-    H = S.meshHierarchy_;
-elseif isfield(S, 'H')
-    H = S.H;
-else
-    error('MAT-file must contain meshHierarchy_ or H.');
-end
-
+H= meshHierarchy_;
 numGPUs = 2;
 level = 1;       % Restrict from this level to level + 1
 numSamples = 64;

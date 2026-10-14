@@ -455,8 +455,8 @@ function partitions = BuildGenericLeftRightNodeHalos( ...
         % Owned element range [lowerElement, upperElement] touches node
         % coordinates [lowerElement, upperElement+1].
         leftMin  = max(1, lowerElement - haloWidth);
-        leftMax  = lowerElement - 1;
-        rightMin = upperElement + 2;
+        leftMax  = lowerElement;
+        rightMin = upperElement + 1;
         rightMax = min(axisNodeCount, upperElement + 1 + haloWidth);
         if isempty(localIds)
             % No active work lives in this slab, so it does not need halo data.

@@ -53,5 +53,5 @@ fineResidual = randn(double(H(level).numDOFs), 1);
 fprintf('Validating restriction: level %d -> %d on %d GPUs\n', ...
     level, level + 1, numGPUs);
 maxAbsError = Validate_RestrictResidual_MGPU( ...
-    H, numGPUs, fineResidual, level, numSamples);
+    H, numGPUs, 1e-05);
 fprintf('Maximum sampled absolute error: %.16e\n', maxAbsError);

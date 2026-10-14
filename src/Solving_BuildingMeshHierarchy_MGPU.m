@@ -476,9 +476,7 @@ function Solving_BuildingMeshHierarchy_MGPU()
 
                         iNode = localENodMat(ee, nn);
 
-                        localNodeToElementsCount(iNode) = ...
-
-                            localNodeToElementsCount(iNode) + 1;
+                        localNodeToElementsCount(iNode) = localNodeToElementsCount(iNode) + 1;
 
                         slot = localNodeToElementsCount(iNode);
 
@@ -534,15 +532,9 @@ function Solving_BuildingMeshHierarchy_MGPU()
 
                 % without changing this existing local-only map.
 
-                P.nodMapForward = zeros( ...
+                P.nodMapForward = zeros( (current.resX+1) * (current.resY+1) * (current.resZ+1), 1, 'int32');
 
-                    (current.resX+1) * (current.resY+1) * (current.resZ+1), ...
-
-                    1, 'int32');
-
-                P.nodMapForward(double(P.nodGridId)) = ...
-
-                    int32(1:P.numNodes);
+                P.nodMapForward(double(P.nodGridId)) = int32(1:P.numNodes);
 
                 % Store P only after every field above has been added.
 
@@ -586,9 +578,7 @@ function Solving_BuildingMeshHierarchy_MGPU()
 
     % partition edges on neighboring levels do not align exactly.
 
-    if isfield(meshHierarchy_(1), 'partitions') && ...
-
-            ~isempty(meshHierarchy_(1).partitions)
+    if isfield(meshHierarchy_(1), 'partitions') && ~isempty(meshHierarchy_(1).partitions)
 
         % Halo width belongs to the NEXT restriction transition, not a
         % constant shared by every level. In a non-dyadic hierarchy the first
@@ -600,9 +590,7 @@ function Solving_BuildingMeshHierarchy_MGPU()
                 haloWidth = 0; % coarsest level has no outgoing restriction
             end
 
-            if ~isfield(meshHierarchy_(levelId), 'partitions') || ...
-
-                    isempty(meshHierarchy_(levelId).partitions)
+            if ~isfield(meshHierarchy_(levelId), 'partitions') || isempty(meshHierarchy_(levelId).partitions)
 
                 continue;
 
@@ -642,9 +630,7 @@ function Solving_BuildingMeshHierarchy_MGPU()
 
                     if ~isfield(partitions{g}, 'range') || isempty(partitions{g}.range)
 
-                        partitions{g}.range = int32( ...
-
-                            [finestEdges(g)+1, finestEdges(g+1)]);
+                        partitions{g}.range = int32( [finestEdges(g)+1, finestEdges(g+1)]);
 
                     end
 
@@ -677,9 +663,7 @@ function Solving_BuildingMeshHierarchy_MGPU()
                 end
             end
 
-            partitions = BuildGenericLeftRightNodeHalos( ...
-
-                level, partitions, levelNodeGridId, haloWidth);
+            partitions = BuildGenericLeftRightNodeHalos( level, partitions, levelNodeGridId, haloWidth);
 
             meshHierarchy_(levelId).partitions = partitions;
 

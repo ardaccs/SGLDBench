@@ -179,17 +179,43 @@ function Solving_BuildingMeshHierarchy_MGPU()
             %% ============================================================
             if isfield(meshHierarchy_(1), 'partitions') && ~isempty(meshHierarchy_(1).partitions)
                 numGPUs = numel(meshHierarchy_(1).partitions);
+
                 % Determine split axis from finest level
                 finest = meshHierarchy_(1);
-                finestDims = [finest.resX, finest.resY, finest.resZ];
+
+                finestDims = double([finest.resX, finest.resY, finest.resZ]);
                 splitAxis = double(finest.partitionSplitAxis);
-                finestEdges = double(finest.partitionEdges);
-                finestAxisLength = finestDims(splitAxis);
+                finestEdges = double(finest.partitionEdges(:)');
+
                 % Project finest partition onto CURRENT hierarchy level
                 current = meshHierarchy_(ii);
-                currentDims = [ current.resX, current.resY, current.resZ];
+                currentDims = double([current.resX, current.resY, current.resZ]);
+
+                % Verify geometry before computing partition edges
+                assert(isscalar(splitAxis) && ...
+                    ismember(splitAxis, [1, 2, 3]), ...
+                    'Level %d: invalid partitionSplitAxis: %s', ...
+                    ii, mat2str(splitAxis));
+
+                assert(numel(finestDims) == 3 && ...
+                    numel(currentDims) == 3 && ...
+                    all(isfinite(currentDims)), ...
+                    'Level %d: invalid dimensions. Finest=%s, Current=%s', ...
+                    ii, mat2str(finestDims), mat2str(currentDims));
+
+                assert(numel(finestEdges) == numGPUs + 1, ...
+                    'Level %d: expected %d partition edges, got %d.', ...
+                    ii, numGPUs + 1, numel(finestEdges));
+
+                finestAxisLength = finestDims(splitAxis);
                 currentAxisLength = currentDims(splitAxis);
-                edges = round( finestEdges / double(finestAxisLength) * double(currentAxisLength));
+
+                assert(isscalar(currentAxisLength) && ...
+                    isfinite(currentAxisLength) && currentAxisLength > 0, ...
+                    'Level %d: invalid currentAxisLength: %s', ...
+                    ii, mat2str(currentAxisLength));
+
+                edges = round(finestEdges / finestAxisLength * currentAxisLength);
                 edges(1) = 0;
                 edges(end) = currentAxisLength;
                 % Ensure valid non-empty slabs if possible

@@ -401,9 +401,7 @@ function Solving_BuildingMeshHierarchy_MGPU()
                 end
 
                 assert(all(diff(edges) > 0), ...
-
                     'Level %d is too coarse for %d GPU slabs.', ...
-
                     ii, numGPUs);
 
                 % Calculate element coordinates for current level

@@ -631,8 +631,13 @@ static void configurePeerAccess(int numGPUs)
             CUDA_CHECK(cudaDeviceCanAccessPeer(&canAccessPeer, g, neighbor));
             if (canAccessPeer) {
                 cudaError_t result = cudaDeviceEnablePeerAccess(neighbor, 0);
-                if (result != cudaSuccess && result != cudaErrorPeerAccessAlreadyEnabled)
+                if (result == cudaErrorPeerAccessAlreadyEnabled) {
+                    // This is harmless, but it is also recorded as the thread's
+                    // pending CUDA error. Clear it before launching any kernels.
+                    (void)cudaGetLastError();
+                } else {
                     CUDA_CHECK(result);
+                }
             }
             // Otherwise cudaMemcpyPeerAsync can use runtime-managed staging;
             // no direct NVLink/PCIe peer-access assumption is made here.

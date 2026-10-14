@@ -61,8 +61,7 @@ function FEA_VoxelBasedDiscretization_MGPU(numGPUs)
     %% 3.5 Split the mesh along the longest axis for multi-GPU processing
     dims = [nx, ny, nz];
     [~, splitAxis] = max(dims);
-
-    edges = round(linspace(0, dims(splitAxis), numGPUs + 1));
+    %%edges = round(linspace(0, dims(splitAxis), numGPUs + 1));
 
 	%%4. identify solid&void elements 
 	voxelizedVolume_ = voxelizedVolume_(:);
@@ -75,6 +74,8 @@ function FEA_VoxelBasedDiscretization_MGPU(numGPUs)
 	meshHierarchy_.colors = Solving_Coloring(meshHierarchy_.eleMapForward, nx, ny, nz);
 	
     %% 4.5 Partition the mesh for multi-GPU processing
+
+    % Get the global 3D coordinates of each active element in the voxel grid
     [yEle, xEle, zEle] = ind2sub( ...
         [ny, nx, nz], ...
         double(globalEleMapBack));
@@ -114,38 +115,20 @@ function FEA_VoxelBasedDiscretization_MGPU(numGPUs)
     end
 
     % Guarantee strictly increasing boundaries so every GPU owns at least
-
     % one geometric slab. First push cuts forward, then backward if needed.
-
     for g = 2:numGPUs
-
         edges(g) = max(edges(g), edges(g-1) + 1);
-
     end
-
-
 
     for g = numGPUs:-1:2
-
         edges(g) = min(edges(g), edges(g+1) - 1);
-
     end
 
+    assert(all(diff(edges) > 0), 'Unable to create non-empty GPU slabs.');
 
-
-    edges(1) = 0;
-
-    edges(end) = axisLength;
-
-
-
-    assert(all(diff(edges) > 0), ...
-        'Unable to create non-empty GPU slabs.');
-
-    % Store the finest-level decomposition so every coarser level can
-    % project exactly the same partition boundaries.
-    %meshHierarchy_.partitionSplitAxis = int32(splitAxis);
-    %meshHierarchy_.partitionEdges = int32(edges);
+    % Store the finest-level decomposition so every coarser level can project exactly the same partition boundaries.
+    meshHierarchy_(1).partitionSplitAxis = int32(splitAxis);
+    meshHierarchy_(1).partitionEdges = int32(edges);
 
     meshHierarchy_.partitions = cell(numGPUs,1);
 
@@ -156,37 +139,20 @@ function FEA_VoxelBasedDiscretization_MGPU(numGPUs)
     fprintf('\n');
 
     for i = 1:numGPUs
-
-
-
         lower = edges(i) + 1;
-
         upper = edges(i+1);
 
-
+        % Get the active elements that fall within this partitions slab along the split axis.
 
         if splitAxis == 1
-
             mask = xEle >= lower & xEle <= upper;
-
-
-
         elseif splitAxis == 2
-
             mask = yEle >= lower & yEle <= upper;
-
-
-
         else
-
             mask = zEle >= lower & zEle <= upper;
-
         end
 
-
-
         % Active element IDs that are part of this partition
-
         elementIds = find(mask);
 
         meshHierarchy_.partitions{i}.elementIds = int32(elementIds);
@@ -194,10 +160,7 @@ function FEA_VoxelBasedDiscretization_MGPU(numGPUs)
         meshHierarchy_.partitions{i}.range = int32([lower upper]);
         meshHierarchy_.partitions{i}.splitAxis = int32(splitAxis);
 
-
-
         % Global element IDs that are part of this partition. So partition.eleMapBack contains their actual voxel grid positions.
-
         meshHierarchy_.partitions{i}.eleMapBack = globalEleMapBack(elementIds);
 
     end
@@ -205,33 +168,21 @@ function FEA_VoxelBasedDiscretization_MGPU(numGPUs)
     %%5. discretize
 
     nodenrs = reshape(1:(nx+1)*(ny+1)*(nz+1), 1+ny, 1+nx, 1+nz); nodenrs = int32(nodenrs);
-
     eNodVec = reshape(nodenrs(1:end-1,1:end-1,1:end-1)+1, nx*ny*nz, 1);
-
     eNodMatHalfTemp_ = repmat(eNodVec,1,8);
-
     eNodMat = repmat(eNodVec(meshHierarchy_.eleMapBack),1,8);   
-
     tmp = [0 ny+[1 0] -1 (ny+1)*(nx+1)+[0 ny+[1 0] -1]]; tmp = int32(tmp);
 
     for ii=1:8
-
         eNodMat(:,ii) = eNodMat(:,ii) + repmat(tmp(ii), meshHierarchy_.numElements,1);
-
         eNodMatHalfTemp_(:,ii) = eNodMatHalfTemp_(:,ii) + repmat(tmp(ii), nx*ny*nz,1);  
-
     end
 
     eNodMatHalfTemp_ = eNodMatHalfTemp_(:,[3 4 7 8]);
-
     meshHierarchy_.nodMapBack = unique(eNodMat);
-
     meshHierarchy_.numNodes = length(meshHierarchy_.nodMapBack);
-
     meshHierarchy_.numDOFs = meshHierarchy_.numNodes*3;
-
     meshHierarchy_.nodMapForward = zeros((nx+1)*(ny+1)*(nz+1),1, 'int32');
-
     meshHierarchy_.nodMapForward(meshHierarchy_.nodMapBack) = (1:meshHierarchy_.numNodes)';
 
     % Full Cartesian-grid node IDs for active finest-level nodes.
@@ -239,105 +190,56 @@ function FEA_VoxelBasedDiscretization_MGPU(numGPUs)
     meshHierarchy_.nodGridId = int32(meshHierarchy_.nodMapBack);
 
     for ii=1:8
-
         eNodMat(:,ii) = meshHierarchy_.nodMapForward(eNodMat(:,ii));
-
     end 
 
-
-
-    %% Build GPU-local connectivity
+    %% Build GPU-local connectivity'
 
     for i = 1:numGPUs
 
-
-
         %% Active element IDs that are part of this partition.
-
         elementIds = meshHierarchy_.partitions{i}.elementIds;
 
-
-
         % Rows belonging to this GPU
-
         eNodMatGlobal = eNodMat(elementIds,:);
 
-
-
         % Global active node IDs needed by this GPU
-
         globalNodeIds = unique(eNodMatGlobal(:));
-
         meshHierarchy_.partitions{i}.globalNodeIds = int32(globalNodeIds);
         meshHierarchy_.partitions{i}.numNodes = numel(globalNodeIds);
 
         % Local active node -> full Cartesian-grid node ID.
         % This is the same representation used on coarser MGPU levels.
-        meshHierarchy_.partitions{i}.nodGridId = int32( ...
-            meshHierarchy_.nodGridId(double(globalNodeIds)));
+        meshHierarchy_.partitions{i}.nodGridId = int32( meshHierarchy_.nodGridId(double(globalNodeIds)));
 
         % Filled below after every partition's globalNodeIds are known.
         % sharedNodesLocal{j}(k) gives the local node ID on this GPU that
         % corresponds to the same physical node as GPU j's k-th entry.
         meshHierarchy_.partitions{i}.sharedNodesLocal = cell(1, numGPUs);
 
-
-
-
-
         globalToLocal = zeros(meshHierarchy_.numNodes,1,'int32');
-
         globalToLocal(globalNodeIds) = int32(1:numel(globalNodeIds));
-
         eNodMatLocal = globalToLocal(eNodMatGlobal);
-
         meshHierarchy_.partitions{i}.eNodMat = eNodMatLocal;
-
-
-
-
 
         %% Build node-to-element mapping for this GPU
 
-
-
         numLocalNodes = numel(globalNodeIds);
-
         numLocalElements = numel(elementIds);
-
         nodeToElements = zeros(numLocalNodes,8,'int32');
-
         nodeToElementsCount = zeros(numLocalNodes,1,'int32');
-
-
 
         for ee = 1:numLocalElements
 
-
-
             for nn = 1:8
 
-
-
                 node = eNodMatLocal(ee,nn);
-
-
-
                 nodeToElementsCount(node) = nodeToElementsCount(node) + 1;
-
-
-
                 slot = nodeToElementsCount(node);
 
-
-
                 if slot > 8
-
                     error('Node touches more than 8 elements.');
-
                 end
-
-
 
                 nodeToElements(node,slot) = ee;
 
@@ -363,6 +265,7 @@ function FEA_VoxelBasedDiscretization_MGPU(numGPUs)
     for g1 = 1:numGPUs
         for g2 = g1+1:numGPUs
 
+            % Find the global node IDs that are shared between these two GPUs. Then find the local node IDs on each GPU that correspond to those global IDs.
             globalNodes1 = meshHierarchy_.partitions{g1}.globalNodeIds;
             globalNodes2 = meshHierarchy_.partitions{g2}.globalNodeIds;
 
@@ -371,11 +274,8 @@ function FEA_VoxelBasedDiscretization_MGPU(numGPUs)
             [~, localNodes1] = ismember(sharedGlobalNodes, globalNodes1);
             [~, localNodes2] = ismember(sharedGlobalNodes, globalNodes2);
 
-            meshHierarchy_.partitions{g1}.sharedNodesLocal{g2} = ...
-                int32(localNodes1(:));
-
-            meshHierarchy_.partitions{g2}.sharedNodesLocal{g1} = ...
-                int32(localNodes2(:));
+            meshHierarchy_.partitions{g1}.sharedNodesLocal{g2} = int32(localNodes1(:));
+            meshHierarchy_.partitions{g2}.sharedNodesLocal{g1} = int32(localNodes2(:));
 
             assert(numel(localNodes1) == numel(localNodes2), ...
                 'Shared-node mapping size mismatch between GPU %d and GPU %d.', ...
@@ -429,53 +329,33 @@ function FEA_VoxelBasedDiscretization_MGPU(numGPUs)
     %%6. identify boundary info.    
 
     meshHierarchy_.numNod2ElesVec = zeros(meshHierarchy_.numNodes,1);
-
     for jj=1:8
-
         iNodes = eNodMat(:,jj);
-
         meshHierarchy_.numNod2ElesVec(iNodes) = meshHierarchy_.numNod2ElesVec(iNodes) + 1;
-
     end 
 
-
-
     meshHierarchy_.nodesOnBoundary = find(meshHierarchy_.numNod2ElesVec<8);
-
     meshHierarchy_.nodesOnBoundary = int32(meshHierarchy_.nodesOnBoundary);
-
     allNodes = zeros(meshHierarchy_.numNodes,1,'int32');
-
     allNodes(meshHierarchy_.nodesOnBoundary) = 1;   
-
     tmp = zeros(meshHierarchy_.numElements,1,'int32');
 
     for ii=1:8
-
         tmp = tmp + allNodes(eNodMat(:,ii));
-
     end
 
     meshHierarchy_.elementsOnBoundary = int32(find(tmp>0));
-
     blockIndex = Solving_MissionPartition(meshHierarchy_.numElements, 5.0e6);
 
     for ii=1:size(blockIndex,1)             
 
         rangeIndex = (blockIndex(ii,1):blockIndex(ii,2))';
-
         patchIndices = eNodMat(rangeIndex, [4 3 2 1  5 6 7 8  1 2 6 5  8 7 3 4  5 8 4 1  2 3 7 6])';
-
         patchIndices = reshape(patchIndices(:), 4, 6*numel(rangeIndex));
-
         tmp = zeros(meshHierarchy_.numNodes, 1);
-
         tmp(meshHierarchy_.nodesOnBoundary) = 1;
-
         tmp = tmp(patchIndices); tmp = sum(tmp,1);
-
         iBoundaryEleFaces = patchIndices(:,find(4==tmp));
-
         meshHierarchy_.boundaryEleFaces(end+1:end+size(iBoundaryEleFaces,2),:) = iBoundaryEleFaces';
 
     end

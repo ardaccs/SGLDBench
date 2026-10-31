@@ -1729,22 +1729,22 @@ static void initializeCoarseSolver(
 }
 
 static void zeroFixedDOFs(
-    SolverContext& solver,
+    singleGPUData& G,
     double* d_vector)
 {
-    if (solver.numFixedDOFs == 0)
+    if (G.numFixedDOFs == 0)
         return;
 
     constexpr int blockSize = 256;
+
     const int gridSize =
-        gridSizeFor(
-            solver.numFixedDOFs,
-            blockSize);
+        gridSizeFor(G.numFixedDOFs, blockSize);
 
     zeroSelectedDOFsKernel<<<gridSize, blockSize>>>(
         d_vector,
-        solver.d_fixedDOFIds,
-        solver.numFixedDOFs);
+        G.d_fixedDOFIds,
+        G.numFixedDOFs
+    );
 
     CUDA_CHECK(cudaGetLastError());
 }
@@ -2009,6 +2009,7 @@ static void applyVcycle(
                 cudaMemcpyDeviceToDevice));
     }
 }
+
 __global__ void substractVectorsInPlaceKernel(
     const double* a,
     double* b,
@@ -2021,13 +2022,132 @@ __global__ void substractVectorsInPlaceKernel(
     }
 }
 
-static void applyFinestOperator(
-    SolverContext& solver,
-    const double* d_x,
-    double* d_Ax)
+__global__ void packHaloKernel(const double* localResidual, const int32_t* sendLocal,
+                               double* sendBuffer, int numSendNodes)
 {
+    const int node = blockIdx.x * blockDim.x + threadIdx.x;
+    if (node >= numSendNodes) return;
+    const int source = 3 * (sendLocal[node] - 1); // MATLAB 1-based
+    const int target = 3 * node;
+    sendBuffer[target]     = localResidual[source];
+    sendBuffer[target + 1] = localResidual[source + 1];
+    sendBuffer[target + 2] = localResidual[source + 2];
+}
+
+__global__ void addReceivedInterfaceKernel(
+    double* d_Ax,
+    const double* d_recvBuffer,
+    const int32_t* d_recvLocal,
+    int numNodes)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= numNodes) return;
+
+    int dst = 3 * (d_recvLocal[i] - 1);
+    int src = 3 * i;
+
+    d_Ax[dst]     += d_recvBuffer[src];
+    d_Ax[dst + 1] += d_recvBuffer[src + 1];
+    d_Ax[dst + 2] += d_recvBuffer[src + 2];
+}
+
+static void copyBoundaryToHalo(
+    int8 sourceId,
+    double* d_sourceLocal,
+    int8 targetId,
+    double* d_recvLoval,
+    int numBoundaryNodes,
+    cudaStream_t stream)
+{
+    if (numBoundaryNodes <= 0)
+        return;
+
+    CUDA_CHECK(cudaSetDevice(sourceId));
+
+    // Copy boundary data to halo region on the same GPU
+    CUDA_CHECK(cudaMemcpyPeerAsync(
+        d_recvLoval,
+        targetId,
+        d_sourceLocal,
+        sourceId,
+        static_cast<size_t>(numBoundaryNodes) * 3 * sizeof(double),
+        stream));
+}
+
+static cudaError_t sendOneSideHalo(singleGPUData& G, HaloSide& S, cudaStream_t stream,
+                               const std::vector<singleGPUData>& gpuData)
+{
+    if (S.sendLocal.empty()) return cudaSuccess;
+    if (S.neighborGPU < 0) return cudaErrorInvalidDevice;
+    const int count = (int)S.sendLocal.size();
+    const int block = 256;
+    const int grid = (count + block - 1) / block;
+    packHaloKernel<<<grid, block, 0, stream>>>(
+        G.levels[x].d_fineResidual, S.d_sendLocal, S.d_sendBuffer, count);
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+    double* recv = gpuData[S.neighborGPU].levels[0].d_fineResidual
+                   + 3 * ((size_t)S.sendDestLocal[0] - 1);
+    return copyBoundaryToHalo(G.deviceId, S.d_sendBuffer,
+                              S.neighborGPU, recv, count, stream);
+}
+static void sendOneSideInterface(
+    singleGPUData& G,
+    InterfaceSide& S,
+    const double* d_Ax,
+    cudaStream_t stream,
+    double* receiveBuffer)
+{
+    if (S.sendLocal.empty())
+        return;
+
+    if (S.neighborGPU < 0)
+        throw std::runtime_error("Invalid interface neighbor");
+
+    CUDA_CHECK(cudaSetDevice(G.deviceId));
+
+    const int count =
+        static_cast<int>(S.sendLocal.size());
+
+    constexpr int block = 256;
+    const int grid = gridSizeFor(count, block);
+
+    packHaloKernel<<<grid, block, 0, stream>>>(
+        d_Ax,
+        S.d_sendLocal,
+        S.d_sendBuffer,
+        count
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+
+    copyBoundaryToHalo(
+        G.deviceId,
+        S.d_sendBuffer,
+        S.neighborGPU,
+        receiveBuffer,
+        count,
+        stream
+    );
+}
+
+static void applyFinestOperator(
+    singleGPUData& G,
+    const double* d_x,
+    double* d_Ax,
+    std::vector<StreamData>& comm_stream,
+    const std::vector<singleGPUData>& gpuData)
+{
+    const int numGPUs = G.numGPUs;
+    const int deviceId = G.deviceId;
+
     constexpr int blockSize = 256;
-    Level& finest = solver.levels[0];
+
+    Level& finest = G.levels[0];
+    StreamData& streams = comm_stream[deviceId];
+
+    CUDA_CHECK(cudaSetDevice(deviceId));
 
     const int gridSize = gridSizeFor(finest.numNodes, blockSize);
 
@@ -2038,36 +2158,167 @@ static void applyFinestOperator(
         finest.d_eNodMat,
         finest.d_eleModulus,
         finest.numNodes,
-        finest.numElements);
+        finest.numElements
+    );
 
     CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-    zeroFixedDOFs(solver, d_Ax);
-}
-
-static void runMGPCG(
-    SolverContext& solver)
-{
-    if (!solver.initialized || solver.levels.empty() || solver.cublasHandle == nullptr)
+    // Send to the right neighbor.
+    if (finest.rightInterface.neighborGPU >= 0)
     {
-        throw std::runtime_error("The solver context is not fully initialized.");
+        const int neighbor = finest.rightInterface.neighborGPU;
+
+        sendOneSideInterface(
+            G,
+            finest.rightInterface,
+            d_Ax,
+            streams.rightStream,
+            gpuData[neighbor].levels[0] .leftInterface.d_recvBuffer
+        );
     }
 
+    // Send to the left neighbor.
+    if (finest.leftInterface.neighborGPU >= 0)
+    {
+        const int neighbor = finest.leftInterface.neighborGPU;
+
+        sendOneSideInterface(
+            G,
+            finest.leftInterface,
+            d_Ax,
+            streams.leftStream,
+            gpuData[neighbor].levels[0].rightInterface.d_recvBuffer
+        );
+    }
+
+    if (finest.rightInterface.neighborGPU >= 0 &&
+        streams.rightStream != nullptr)
+    {
+        CUDA_CHECK(cudaStreamSynchronize(streams.rightStream));
+    }
+
+    if (finest.leftInterface.neighborGPU >= 0 && streams.leftStream != nullptr)
+    {
+        CUDA_CHECK(cudaStreamSynchronize(streams.leftStream));
+    }
+
+    // Every thread has finished its outgoing copies.
+    #pragma omp barrier
+
+    InterfaceSide& left  = finest.leftInterface;
+    InterfaceSide& right = finest.rightInterface;
+
+    // Receive contributions from LEFT neighbor
+    if (left.recvCount > 0)
+    {
+        const int grid = gridSizeFor(left.recvCount, blockSize);
+
+        addReceivedInterfaceKernel
+            <<<grid, blockSize, 0, streams.leftStream>>>(
+                d_Ax,
+                left.d_recvBuffer,
+                left.d_recvLocal,
+                left.recvCount
+            );
+
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // Receive contributions from RIGHT neighbor
+    if (right.recvCount > 0)
+    {
+        const int grid =
+            gridSizeFor(right.recvCount, blockSize);
+
+        addReceivedInterfaceKernel
+            <<<grid, blockSize, 0, streams.rightStream>>>(
+                d_Ax,
+                right.d_recvBuffer,
+                right.d_recvLocal,
+                right.recvCount
+            );
+
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // Wait until both accumulations are finished
+    if (left.recvCount > 0)
+    {
+        CUDA_CHECK(cudaStreamSynchronize(streams.leftStream));
+    }
+
+    if (right.recvCount > 0)
+    {
+        CUDA_CHECK(cudaStreamSynchronize(streams.rightStream));
+    }
+
+    // Apply fixed DOF constraints to the result vector.
+    zeroFixedDOFs(G, d_Ax);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    #pragma omp barrier
+}
+
+
+static void runMGPCG(
+    std::vector<singleGPUData&> solver,
+    std::vector<StreamData>& comm_stream,
+    int8 numGPUs)
+{
+    std::vector<ncclComm_t> comms(numGPUs);
+
+
+    const int plannedHostNumThreads = numGPUs;
+    const int cpu_cores = omp_get_num_procs();
+    mexPrintf("CPU logical threads available: %d\n", cpu_cores);
+    omp_set_dynamic(0);
+    omp_set_num_threads(plannedHostNumThreads);
+
+    for (auto& s : solver)
+    {
+        if (!s.initialized || s.levels.empty() || s.cublasHandle == nullptr)
+        {
+            throw std::runtime_error("The solver context is not fully initialized.");
+        }
+    }
+    
+    for (int i = 0; i < numGPUs; ++i) {
+        CUDA_CHECK(cudaSetDevice(gpuData[i].deviceId));
+        int leastPriority = 0, greatestPriority = 0;
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority));
+
+        NCCL_CHECK(ncclCommInitRank(&comms[i], numGPUs, ncclId, i));
+
+        const int priority = greatestPriority;
+        if (i > 0) {
+            CUDA_CHECK(cudaStreamCreateWithPriority(
+                &comm_stream[i].leftStream, cudaStreamNonBlocking, priority));
+        }
+        if (i < numGPUs - 1) {
+            CUDA_CHECK(cudaStreamCreateWithPriority(
+                &comm_stream[i].rightStream, cudaStreamNonBlocking, priority));
+        }
+    }
+
+    for (int i = 0; i < numGPUs; ++i) {
+        singleGPUData& solver = gpuData[i];
+        solver.iterations = 0;
+        solver.relativeResidual = 0.0;
+        solver.converged = false;
+
+        zeroFixedDOFs(solver, solver.d_r);
+        zeroFixedDOFs(solver, solver.d_y);
+    }
+    
     const int n = solver.levels[0].numDOFs;
-    cublasHandle_t handle = solver.cublasHandle;
+
+    //cublasHandle_t handle = solver.cublasHandle;
 
     const double one = 1.0;
     const double minusOne = -1.0;
 
-    solver.iterations = 0;
-    solver.relativeResidual = 0.0;
-    solver.converged = false;
-
-    zeroFixedDOFs(solver, solver.d_r);
-    zeroFixedDOFs(solver, solver.d_y);
-
     double normB = 0.0;
-
+    
     // Global op
     CUBLAS_CHECK(
         cublasDnrm2(
@@ -2078,28 +2329,38 @@ static void runMGPCG(
             &normB));
 
     // r = b - A*y
-    nvtxRangePushA("MGPCG:applyFinestOperator");
-    applyFinestOperator(solver, solver.d_y,solver.d_Ap);
-    nvtxRangePop();
+    #pragma omp parallel num_threads(numGPUs)
+    {
+        int g = omp_get_thread_num();
+        singleGPUData& solver = gpuData[g];
+        CUDA_CHECK(cudaSetDevice(g));
 
-    nvtxRangePushA("MGPCG:initialResidual");
+        applyFinestOperator(
+            gpuData[g],
+            gpuData,
+            d_x[g],
+            d_Ax[g],
+            comm_stream[g]
+        );
+        #pragma omp barrier
+        // Local op
+        CUBLAS_CHECK(
+            cublasDaxpy(
+                handle,
+                n,
+                &minusOne,
+                solver.d_Ap,
+                1,
+                solver.d_r,
+                1));
+        #pragma omp barrier
+        zeroFixedDOFs(solver, solver.d_r);
+        #pragma omp barrier
 
-    // Local op
-    CUBLAS_CHECK(
-        cublasDaxpy(
-            handle,
-            n,
-            &minusOne,
-            solver.d_Ap,
-            1,
-            solver.d_r,
-            1));
-
-    nvtxRangePop();
-    zeroFixedDOFs(solver, solver.d_r);
+    }
 
     double residualNorm = 0.0;
-
+    
     //Global op
     CUBLAS_CHECK(
         cublasDnrm2(
@@ -2110,29 +2371,29 @@ static void runMGPCG(
             &residualNorm));
 
     const double residualDenominator = (normB > 0.0) ? normB : 1.0;
-
+    double relativeResidual = residualNorm / residualDenominator;
     // Broadcast the initial relative residual to all GPUs
-    solver.relativeResidual = residualNorm / residualDenominator;
-
-    if (!std::isfinite(solver.relativeResidual))
+    #pragma omp parallel num_threads(numGPUs)
     {
-        throw std::runtime_error("The initial relative residual is not finite.");
-    }
+        int g = omp_get_thread_num();
+        singleGPUData& solver = gpuData[g];
+        solver.relativeResidual = relativeResidual;
+        if (!std::isfinite(solver.relativeResidual))
+        {
+            throw std::runtime_error("The initial relative residual is not finite.");
+        }
 
-    if (solver.relativeResidual < solver.tolerance || residualNorm == 0.0)
-    {
-        solver.converged = true;
-        return;
+        if (solver.relativeResidual < solver.tolerance || residualNorm == 0.0)
+        {
+            solver.converged = true;
+            return;
+        }
     }
 
     // z = M^{-1}r; p = z; rho = z'*r
-
-    nvtxRangePushA("MGPCG:applyVcycle1");
     // Local to global
     applyVcycle(solver, solver.d_r, solver.d_Ap);
-    nvtxRangePop();
 
-    // Todo:not sure
     CUBLAS_CHECK(
         cublasDcopy(
             handle,
@@ -2143,7 +2404,7 @@ static void runMGPCG(
             1));
 
     double rho = 0.0;
-    // Global op Todo:check again??
+
     CUBLAS_CHECK(
         cublasDdot(
             handle,
@@ -2158,7 +2419,7 @@ static void runMGPCG(
     {
         throw std::runtime_error("PCG breakdown: the initial z'*r is non-positive or non-finite.");
     }
-
+    #pragma omp barrier
     // Start the main PCG iteration loop.
     nvtxRangePushA("MGPCG:mainLoop");
     for (int its = 1; its <= solver.maxIterations; ++its)
@@ -2168,6 +2429,7 @@ static void runMGPCG(
         nvtxRangePop();
         double pAp = 0.0;
 
+        // Global op
         CUBLAS_CHECK(
             cublasDdot(
                 handle,
@@ -2197,6 +2459,7 @@ static void runMGPCG(
         }
 
         const double minusAlpha = -alpha;
+
         // Local op
         CUBLAS_CHECK(
             cublasDaxpy(
@@ -2207,6 +2470,7 @@ static void runMGPCG(
                 1,
                 solver.d_y,
                 1));
+        
         // Local op
         CUBLAS_CHECK(
             cublasDaxpy(
@@ -2221,6 +2485,7 @@ static void runMGPCG(
         // Zeroes out the entries corresponding to fixed degrees of freedom
         zeroFixedDOFs(solver, solver.d_y);
         zeroFixedDOFs(solver, solver.d_r);
+        
         // Global op
         CUBLAS_CHECK(
             cublasDnrm2(
@@ -2248,9 +2513,26 @@ static void runMGPCG(
             break;
         }
         nvtxRangePushA("MGPCG:applyVcycle2");
-        applyVcycle(solver, solver.d_r, solver.d_Ap);
-        nvtxRangePop();
+        #pragma omp parallel num_threads(numGPUs)
+        {
+            const int g = omp_get_thread_num();
+
+            CUDA_CHECK(cudaSetDevice(g));
+
+            singleGPUData& G = gpuData[g];
+
+            applyVcycle(
+                G,
+                G.d_r,
+                G.d_Ap,
+                gpuData,
+                comm_stream,
+                globalCoarse,
+                vcycleShared
+            );
+        }      
         double rhoNew = 0.0;
+
         // Global op
         CUBLAS_CHECK(
             cublasDdot(
@@ -2279,8 +2561,9 @@ static void runMGPCG(
         {
             throw std::runtime_error("PCG breakdown: beta is not finite.");
         }
-        // Local op
+
         // p = z + beta*p
+        // Local op
         CUBLAS_CHECK(
             cublasDscal(
                 handle,
@@ -2288,6 +2571,7 @@ static void runMGPCG(
                 &beta,
                 solver.d_p,
                 1));
+        
         // Local op
         CUBLAS_CHECK(
             cublasDaxpy(

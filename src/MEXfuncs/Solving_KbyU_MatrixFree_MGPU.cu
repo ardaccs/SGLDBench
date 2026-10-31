@@ -468,7 +468,14 @@ void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[])
         mxGetNumberOfElements(prhs[4]) != 1 || mxGetScalar(prhs[4]) != 2)
         mexErrMsgIdAndTxt("mgpu:numGPUs",
             "This version supports exactly two GPUs.");
-
+    if (hierarchyMx == nullptr ||
+        !mxIsStruct(hierarchyMx) ||
+        mxGetNumberOfElements(hierarchyMx) != numGPUs)
+    {
+        mexErrMsgIdAndTxt(
+            "mgpu:hierarchy",
+            "H must contain exactly numGPUs structs.");
+    }
     const size_t numGPUs = 2;
     std::vector<singleGPUData> gpuData;
     initializeGPUData(hierarchyMx, bMx, yMx, numGPUs, gpuData);

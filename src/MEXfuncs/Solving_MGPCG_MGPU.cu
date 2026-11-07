@@ -179,8 +179,11 @@ struct Level
     double* d_coarseResidual = nullptr;  // normal local nodes only
     HaloSide left, right;
 
-    // V-cycle partitioning information for this level.
-
+    // V-cycle workspace.
+    double* d_rhs = nullptr;
+    double* d_x = nullptr;
+    double* d_rTilde = nullptr;
+    
     // KbyU kernel partitioning information for this level.
     InterfaceSide leftInterface, rightInterface;
 };
@@ -232,6 +235,8 @@ struct singleGPUData
     float totalVcycleTimeMs = 0.0f;
     float totalSpMVTimeMs = 0.0f;
 
+    // Data for coarsest level solve using cuDSS. 
+    coarsetLevelData coarsestLevel;
 };
 
 struct coarsestLevelData
@@ -251,6 +256,21 @@ struct coarsestLevelData
     double* d_coarseX = nullptr;
 
     cudssHandle_t d_cudssHandle = nullptr;
+
+    // All allocated on GPU 0.
+    std::vector<double*> d_recvResidual;
+    std::vector<double*> d_sendResidual;
+    std::vector<int32_t*> d_globalNodeIds;
+    std::vector<int32_t*> d_localNodeIds;
+
+    // Number of normal local coarse nodes per GPU.
+    std::vector<int> localNodeCounts;
+
+    // Full global coarse vectors on GPU 0.
+    double* d_globalRHS = nullptr;
+    double* d_globalX = nullptr;
+
+    int globalNumDOFs = 0;
 };
 
 
@@ -751,6 +771,45 @@ __global__ void restrictResidualKernel(
     coarseResidual[output + 1] = resultY;
     coarseResidual[output + 2] = resultZ;
 
+}
+
+__global__ void gatherGlobalCoarseResidualKernel(
+    const double* __restrict__ localResidual,
+    double* __restrict__ globalResidual,
+    const int32_t* __restrict__ globalNodeIds,
+    int numLocalNodes)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= numLocalNodes)
+        return;
+    
+    const int src = 3 * i;
+    const int dst = 3 * (globalNodeIds[i] - 1);
+
+    globalResidual[dst]     = localResidual[src];
+    globalResidual[dst + 1] = localResidual[src + 1];
+    globalResidual[dst + 2] = localResidual[src + 2];
+}
+
+__global__ void scatterGlobalCoarseResidualKernel(
+    const double* __restrict__ sendBuffer,
+    double* __restrict__ globalResidual,
+    const int32_t* __restrict__ localNodeIds,
+    int numLocalNodes)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= numLocalNodes)
+        return;
+
+    const int src = 3 * i;
+    // Backward mapping from global node ID to local index in the global residual vector.
+    const int dst = 3 * (localNodeIds[i] - 1);
+
+    sendBuffer[dst]     = globalResidual[src];
+    sendBuffer[dst + 1] = globalResidual[src + 1];
+    sendBuffer[dst + 2] = globalResidual[src + 2];
 }
 
 static int gridSizeFor(
@@ -1617,7 +1676,7 @@ static void initializeGPU(
 }
 
 static void initializeCoarseSolver(
-    SolverContext& solver)
+    SingleGPUData& solver)
 {
     const int64_t n =
         static_cast<int64_t>(
@@ -1750,7 +1809,7 @@ static void zeroFixedDOFs(
 }
 
 static void solveCoarsest(
-    SolverContext& solver,
+    SingleGPUData& solver,
     const double* d_rhs,
     double* d_x)
 {
@@ -1868,15 +1927,209 @@ static void destroySolver(
     solver.initialized = false;
 }
 
+static void broadcastCoarseSolution(
+    singleGPUData& G,
+    GlobalCoarseSolve& C,
+    const std::vector<ncclComm_t>& comms)
+{
+    constexpr int rootGPU = 0;
+    constexpr int blockSize = 256;
+
+    const int rank = G.deviceId;
+    const int lastLevel = G.numLevels - 1;
+    const Level& coarse = G.levels[lastLevel];
+
+    const int localDOFs = 3 * G[lastLevel].numNodes;
+
+    // Divide the global coarse solution into each partition's local ordering.
+    for (int g = 0; g < G.numGPUs; ++g)
+    {
+        const int n = C.localNodeCounts[g];
+
+        if (n == 0)
+            continue;
+
+        const int grid = gridSizeFor(n, blockSize);
+
+        scatterGlobalCoarseSolutionKernel
+            <<<grid, blockSize, 0>>>(
+                C.d_sendResidual[g],
+                C.d_globalX[g],
+                C.d_localNodeIds[g],
+                n
+            );
+
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // Copy the global RHS into the local coarse RHS for GPU 0.
+    // Broadcast the global coarse solution to all GPUs.
+    if (rank == rootGPU)
+    {
+        // Send GPU 0's local residual.
+        if (localDOFs > 0)
+        {
+            CUDA_CHECK(cudaMemcpyAsync(
+                C.d_sendResidual[rootGPU],
+                coarse.d_x,
+                static_cast<size_t>(localDOFs) * sizeof(double),
+                cudaMemcpyDeviceToDevice,
+                0
+            ));
+        }
+
+        // Send the other partitions' residuals.
+        NCCL_CHECK(ncclGroupStart());
+
+        for (int g = 1; g < G.numGPUs; ++g)
+        {
+            const int count = 3 * localDOFs;
+
+            if (count == 0)
+                continue;
+
+            NCCL_CHECK(ncclSend(
+                C.d_sendResidual[g],
+                count,
+                ncclDouble,
+                g,
+                comms[rootGPU],
+                0
+            ));
+        }
+
+        NCCL_CHECK(ncclGroupEnd());
+    }
+    else if (localDOFs > 0)
+    {
+        NCCL_CHECK(ncclRecv(
+            coarse.d_x,
+            localDOFs,
+            ncclDouble,
+            rootGPU,
+            comms[rank],
+            0
+        ));
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(0));
+    #pragma omp barrier
+}
+
+static void assembleGlobalCoarseResidual(
+    singleGPUData& G,
+    GlobalCoarseSolve& C,
+    const std::vector<ncclComm_t>& comms)
+{
+    constexpr int rootGPU = 0;
+    constexpr int blockSize = 256;
+
+    const int rank = G.deviceId;
+    const int lastLevel = G.numLevels - 1;
+    const Level& coarse = G.levels[lastLevel];
+
+    const int localDOFs = 3 * C.localNodeCounts[rank];
+
+    if (rank == rootGPU)
+    {
+        // Preserve GPU 0's local residual.
+        if (localDOFs > 0)
+        {
+            CUDA_CHECK(cudaMemcpyAsync(
+                C.d_recvResidual[rootGPU],
+                coarse.d_rhs,
+                static_cast<size_t>(localDOFs) * sizeof(double),
+                cudaMemcpyDeviceToDevice,
+                0
+            ));
+        }
+
+        // Receive the other partitions' residuals.
+        NCCL_CHECK(ncclGroupStart());
+
+        for (int g = 1; g < G.numGPUs; ++g)
+        {
+            const int count = 3 * C.localNodeCounts[g];
+
+            if (count == 0)
+                continue;
+
+            NCCL_CHECK(ncclRecv(
+                C.d_recvResidual[g],
+                count,
+                ncclDouble,
+                g,
+                comms[rootGPU],
+                0
+            ));
+        }
+
+        NCCL_CHECK(ncclGroupEnd());
+    }
+    else if (localDOFs > 0)
+    {
+        NCCL_CHECK(ncclSend(
+            coarse.d_rhs,
+            localDOFs,
+            ncclDouble,
+            rootGPU,
+            comms[rank],
+            0
+        ));
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(0));
+    #pragma omp barrier
+
+    if (rank == rootGPU)
+    {
+        // Reset the global RHS.
+        CUDA_CHECK(cudaMemsetAsync(
+            C.d_globalRHS,
+            0,
+            static_cast<size_t>(C.globalNumDOFs) * sizeof(double),
+            0
+        ));
+
+        // Copy each partition into global ordering.
+        for (int g = 0; g < G.numGPUs; ++g)
+        {
+            const int n = C.localNodeCounts[g];
+
+            if (n == 0)
+                continue;
+
+            const int grid = gridSizeFor(n, blockSize);
+
+            gatherGlobalCoarseResidualKernel
+                <<<grid, blockSize, 0>>>(
+                    C.d_recvResidual[g],
+                    C.d_globalRHS,
+                    C.d_globalNodeIds[g],
+                    n
+                );
+
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        CUDA_CHECK(cudaStreamSynchronize(0));
+    }
+
+    #pragma omp barrier
+}
 static void applyVcycle(
-    SolverContext& solver,
+    singleGPUData& G,
     const double* d_fineResidual,
-    double* d_fineCorrection)
+    double* d_fineCorrection,
+    std::vector<singleGPUData>& gpuData,
+    std::vector<StreamData>& comm_stream,
+    std::vector<ncclComm_t>& ncclComms,
+    GlobalCoarseSolve& globalCoarse,
+    VcycleShared& scratch)
 {
     constexpr int blockSize = 256;
-    const int lastLevel = solver.numLevels - 1;
-
-    Level& finest = solver.levels[0];
+    const int lastLevel = G.numLevels - 1;
+    Level& finest = G.levels[0];
 
     if (finest.d_rhs != d_fineResidual)
     {
@@ -1888,9 +2141,9 @@ static void applyVcycle(
                 cudaMemcpyDeviceToDevice));
     }
 
-    for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
+    for (int levelIndex = 0; levelIndex < G.numLevels; ++levelIndex)
     {
-        Level& level = solver.levels[levelIndex];
+        Level& level = G.levels[levelIndex];
 
         CUDA_CHECK(
             cudaMemset(
@@ -1902,9 +2155,10 @@ static void applyVcycle(
     // Restriction
     for (int fineIndex = 0; fineIndex < lastLevel; ++fineIndex)
     {
-        Level& fine = solver.levels[fineIndex];
-        Level& coarse = solver.levels[fineIndex + 1];
+        Level& fine = G.levels[fineIndex];
+        Level& coarse = G.levels[fineIndex + 1];
 
+        // Todo-->why??
         const int smoothGrid = gridSizeFor(fine.numDOFs, blockSize);
 
         if (fineIndex == 0)
@@ -1916,7 +2170,7 @@ static void applyVcycle(
                 fine.d_dK,
                 fine.d_x,
                 fine.d_x,
-                solver.jacobiOmega,
+                G.jacobiOmega,
                 fine.numDOFs);
         }
         else
@@ -1925,7 +2179,7 @@ static void applyVcycle(
                 fine.d_rhs,
                 fine.d_dK,
                 fine.d_x,
-                solver.jacobiOmega,
+                G.jacobiOmega,
                 fine.numDOFs);
         }
         CUDA_CHECK(cudaGetLastError());
@@ -1944,27 +2198,155 @@ static void applyVcycle(
             fine.nx,
             fine.ny,
             fine.nz,
-            solver.spanWidths[fineIndex]);
+            G.spanWidths[fineIndex]);
         CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        #pragma omp barrier
 
         // Communicate
+        StreamData& streams = comm_stream[G.deviceId];
+
+
+        // Send coarse residual to right GPU.
+        if (coarse.right.neighborGPU >= 0)
+        {
+            const int neighbor = coarse.right.neighborGPU;
+
+            sendOneSideHalo(
+                G,
+                coarse.right,
+                coarse.d_rhs,
+                streams.rightStream
+                gpuData[neighbor].levels[fineIndex + 1].d_rhs,
+            );
+        }
+
+        // Send coarse residual to left GPU.
+        if (coarse.left.neighborGPU >= 0)
+        {
+            const int neighbor = coarse.left.neighborGPU;
+
+            sendOneSideHalo(
+                G,
+                coarse.left,
+                coarse.d_rhs,
+                streams.leftStream,
+                gpuData[neighbor].levels[fineIndex + 1].d_rhs,
+            );
+        }
+
+        // Wait for both outgoing transfers.
+        if (coarse.right.neighborGPU >= 0)
+        {
+            CUDA_CHECK(cudaStreamSynchronize(streams.rightStream));
+        }
+
+        if (coarse.left.neighborGPU >= 0)
+        {
+            CUDA_CHECK(cudaStreamSynchronize(streams.leftStream));
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        #pragma omp barrier
+
     }
-    nvtxRangePushA("MGPCG:solveCoarsest");
-    // Solve the coarsest level system with cuDSS.
-    solveCoarsest(solver, solver.levels[lastLevel].d_rhs, solver.levels[lastLevel].d_x);
-    nvtxRangePop();
+    // Assemble global coarse residual into global coarse residual on GPU 0.
+    // All GPUs participate.
+    assembleGlobalCoarseResidual(
+        G,
+        globalCoarse,
+        ncclComms
+    );
+    // Solve the coarsest level on GPU 0 only.
+    if (G.deviceId == 0)
+    {
+        solveCoarsest(
+            G,
+            G.coarsestLevel.d_globalRHS,
+            G.coarsestLevel.d_globalX
+        );
+
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    // All OpenMP threads wait here.
+    #pragma omp barrier
+
+    // Broadcast the coarse solution from GPU 0 to other GPUs.
+    // Ensure the broadcast is complete before interpolation.
+    broadcastCoarseSolution(
+        G,
+        gpuData,
+        lastLevel
+    );
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+    #pragma omp barrier
+
     // Interpolation and post-smoothing
     for (int coarseIndex = lastLevel; coarseIndex >= 1; --coarseIndex)
     {
         const int fineIndex = coarseIndex - 1;
 
-        Level& fine = solver.levels[fineIndex];
-        Level& coarse = solver.levels[coarseIndex];
+        Level& fine = G.levels[fineIndex];
+        Level& coarse = G.levels[coarseIndex];
+
+        StreamData& streams = comm_stream[G.deviceId];
+
+        // Ensure the coarse correction is ready.
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // ----------------------------------------
+        // Exchange coarse correction halos
+        // ----------------------------------------
+
+        if (coarse.right.neighborGPU >= 0)
+        {
+            const int neighbor = coarse.right.neighborGPU;
+
+            sendOneSideHalo(
+                G.deviceId,
+                coarse.right,
+                coarse.d_x,
+                neighbor,
+                gpuData[neighbor].levels[coarseIndex].d_x,
+                streams.rightStream
+            );
+        }
+
+        if (coarse.left.neighborGPU >= 0)
+        {
+            const int neighbor = coarse.left.neighborGPU;
+
+            sendOneSideHalo(
+                G.deviceId,
+                coarse.left,
+                coarse.d_x,
+                neighbor,
+                gpuData[neighbor].levels[coarseIndex].d_x,
+                streams.leftStream
+            );
+        }
+
+        if (coarse.right.neighborGPU >= 0)
+        {
+            CUDA_CHECK(cudaStreamSynchronize(
+                streams.rightStream));
+        }
+
+        if (coarse.left.neighborGPU >= 0)
+        {
+            CUDA_CHECK(cudaStreamSynchronize(
+                streams.leftStream));
+        }
+
+        // All GPUs have finished sending halo data.
+        #pragma omp barrier
+
+        // ----------------------------------------
+        // Interpolation: fine.d_x += P * coarse.d_x
+        // ----------------------------------------
 
         const int interpolationGrid = gridSizeFor(fine.numNodes, blockSize);
 
-        // fine.d_temp = P * coarse.d_x
-        // Add interpolated coarse correction directly into the existing fine solution.
         interpolateResidualKernel<<<interpolationGrid, blockSize>>>(
             fine.d_nodGridId,
             coarse.d_nodMapForward,
@@ -1977,36 +2359,32 @@ static void applyVcycle(
             fine.nx,
             fine.ny,
             fine.nz,
-            solver.spanWidths[fineIndex]);
+            G.spanWidths[fineIndex]
+        );
 
         CUDA_CHECK(cudaGetLastError());
 
-        const int dofGrid =
-            gridSizeFor(fine.numDOFs, blockSize);
+        // ----------------------------------------
+        // Post-smoothing
+        // ----------------------------------------
 
-        // Second additive Jacobi term.
+        const int dofGrid = gridSizeFor(fine.numDOFs, blockSize);
+
         addDampedJacobiKernel<<<dofGrid, blockSize>>>(
             fine.d_rhs,
             fine.d_dK,
             fine.d_x,
-            solver.jacobiOmega,
-            fine.numDOFs);
+            G.jacobiOmega,
+            fine.numDOFs
+        );
 
         CUDA_CHECK(cudaGetLastError());
 
-        // Communicate
-    }
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-    zeroFixedDOFs(solver, finest.d_x);
-
-    if (d_fineCorrection != finest.d_x)
-    {
-        CUDA_CHECK(
-            cudaMemcpy(
-                d_fineCorrection,
-                finest.d_x,
-                static_cast<size_t>(finest.numDOFs) * sizeof(double),
-                cudaMemcpyDeviceToDevice));
+        // All GPUs finish this level before
+        // proceeding to the next finer level.
+        #pragma omp barrier
     }
 }
 
@@ -2075,23 +2453,41 @@ static void copyBoundaryToHalo(
         stream));
 }
 
-static cudaError_t sendOneSideHalo(singleGPUData& G, HaloSide& S, cudaStream_t stream,
-                               const std::vector<singleGPUData>& gpuData)
+static void sendOneSideHalo(
+    int sourceDeviceId,
+    HaloSide& S,
+    const double* d_src,
+    int neighborDeviceId,
+    double* d_dstNeighbor,
+    cudaStream_t stream)
 {
-    if (S.sendLocal.empty()) return cudaSuccess;
-    if (S.neighborGPU < 0) return cudaErrorInvalidDevice;
-    const int count = (int)S.sendLocal.size();
-    const int block = 256;
-    const int grid = (count + block - 1) / block;
-    packHaloKernel<<<grid, block, 0, stream>>>(
-        G.levels[x].d_fineResidual, S.d_sendLocal, S.d_sendBuffer, count);
-    cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) return error;
-    double* recv = gpuData[S.neighborGPU].levels[0].d_fineResidual
-                   + 3 * ((size_t)S.sendDestLocal[0] - 1);
-    return copyBoundaryToHalo(G.deviceId, S.d_sendBuffer,
-                              S.neighborGPU, recv, count, stream);
+    if (S.sendLocal.empty() || neighborDeviceId < 0)
+        return;
+
+    const int count = static_cast<int>(S.sendLocal.size());
+    const int grid = gridSizeFor(count, 256);
+
+    packHaloKernel<<<grid, 256, 0, stream>>>(
+        d_src,
+        S.d_sendLocal,
+        S.d_sendBuffer,
+        count
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Destination offset in the neighbor's buffer (MATLAB 1-based index)
+    const size_t offset = 3 * static_cast<size_t>(S.sendDestLocal[0] - 1);
+
+    copyBoundaryToHalo(
+        sourceDeviceId,
+        S.d_sendBuffer,
+        neighborDeviceId,
+        d_dstNeighbor + offset,
+        count,
+        stream
+    );
 }
+
 static void sendOneSideInterface(
     singleGPUData& G,
     InterfaceSide& S,
@@ -2392,6 +2788,7 @@ static void runMGPCG(
 
     // z = M^{-1}r; p = z; rho = z'*r
     // Local to global
+    // Each GPU should receive their portion of d_fineResidual
     applyVcycle(solver, solver.d_r, solver.d_Ap);
 
     CUBLAS_CHECK(

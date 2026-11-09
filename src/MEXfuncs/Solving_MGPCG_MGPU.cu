@@ -15,7 +15,12 @@
 #include <stdexcept>
 #include <limits>
 #include <omp.h>
+/*
+Notes on implementation:
+    - One additional issue: throwing a C++ exception from one OpenMP thread while other threads are waiting at a barrier is unsafe. Eventually, CUDA/NCCL errors should be handled through a shared failure mechanism or by aborting the collective operation consistently.
+    - Check Cuda device setting
 
+*/
 // Elementary stiffness matrix (24 x 24 doubles = 4608 bytes).
 __constant__ double c_Ke[24 * 24];
 
@@ -795,7 +800,7 @@ __global__ void gatherGlobalCoarseResidualKernel(
 __global__ void scatterGlobalCoarseResidualKernel(
     const double* __restrict__ sendBuffer,
     double* __restrict__ globalResidual,
-    const int32_t* __restrict__ localNodeIds,
+    const int32_t* __restrict__ globalNodeIds,
     int numLocalNodes)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -803,9 +808,8 @@ __global__ void scatterGlobalCoarseResidualKernel(
     if (i >= numLocalNodes)
         return;
 
-    const int src = 3 * i;
-    // Backward mapping from global node ID to local index in the global residual vector.
-    const int dst = 3 * (localNodeIds[i] - 1);
+    int src = 3 * (globalNodeIds[i] - 1);
+    int dst = 3 * i;
 
     sendBuffer[dst]     = globalResidual[src];
     sendBuffer[dst + 1] = globalResidual[src + 1];
@@ -1942,26 +1946,29 @@ static void broadcastCoarseSolution(
     const int localDOFs = 3 * G[lastLevel].numNodes;
 
     // Divide the global coarse solution into each partition's local ordering.
-    for (int g = 0; g < G.numGPUs; ++g)
+    if (rank == rootGPU)
     {
-        const int n = C.localNodeCounts[g];
+        for (int g = 0; g < G.numGPUs; ++g)
+        {
+            const int n = C.localNodeCounts[g];
 
-        if (n == 0)
-            continue;
+            if (n == 0)
+                continue;
 
-        const int grid = gridSizeFor(n, blockSize);
+            const int grid = gridSizeFor(n, blockSize);
 
-        scatterGlobalCoarseSolutionKernel
-            <<<grid, blockSize, 0>>>(
-                C.d_sendResidual[g],
-                C.d_globalX[g],
-                C.d_localNodeIds[g],
-                n
-            );
+            scatterGlobalCoarseSolutionKernel
+                <<<grid, blockSize, 0>>>(
+                    C.d_sendResidual[g],
+                    C.d_globalX,
+                    C.d_localNodeIds[g],
+                    n
+                );
 
-        CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaGetLastError());
+        }
     }
-
+    CUDA_CHECK(cudaStreamSynchronize(0));
     // Copy the global RHS into the local coarse RHS for GPU 0.
     // Broadcast the global coarse solution to all GPUs.
     if (rank == rootGPU)
@@ -1970,8 +1977,8 @@ static void broadcastCoarseSolution(
         if (localDOFs > 0)
         {
             CUDA_CHECK(cudaMemcpyAsync(
-                C.d_sendResidual[rootGPU],
                 coarse.d_x,
+                C.d_sendResidual[rootGPU],
                 static_cast<size_t>(localDOFs) * sizeof(double),
                 cudaMemcpyDeviceToDevice,
                 0
@@ -1983,7 +1990,8 @@ static void broadcastCoarseSolution(
 
         for (int g = 1; g < G.numGPUs; ++g)
         {
-            const int count = 3 * localDOFs;
+            // Receiving partition's node count.
+            const int count = 3 * C.localNodeCounts[g];
 
             if (count == 0)
                 continue;
@@ -2117,6 +2125,42 @@ static void assembleGlobalCoarseResidual(
 
     #pragma omp barrier
 }
+
+static void sendOneSideHalo(
+    int sourceDeviceId,
+    HaloSide& S,
+    const double* d_src,
+    int neighborDeviceId,
+    double* d_dstNeighbor,
+    cudaStream_t stream)
+{
+    if (S.sendLocal.empty() || neighborDeviceId < 0)
+        return;
+
+    const int count = static_cast<int>(S.sendLocal.size());
+    const int grid = gridSizeFor(count, 256);
+
+    packHaloKernel<<<grid, 256, 0, stream>>>(
+        d_src,
+        S.d_sendLocal,
+        S.d_sendBuffer,
+        count
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Destination offset in the neighbor's buffer (MATLAB 1-based index)
+    const size_t offset = 3 * static_cast<size_t>(S.sendDestLocal[0] - 1);
+
+    copyBoundaryToHalo(
+        sourceDeviceId,
+        S.d_sendBuffer,
+        neighborDeviceId,
+        d_dstNeighbor + offset,
+        count,
+        stream
+    );
+}
+
 static void applyVcycle(
     singleGPUData& G,
     const double* d_fineResidual,
@@ -2133,23 +2177,64 @@ static void applyVcycle(
 
     if (finest.d_rhs != d_fineResidual)
     {
-        CUDA_CHECK(
-            cudaMemcpy(
-                finest.d_rhs,
-                d_fineResidual,
-                static_cast<size_t>(finest.numDOFs) * sizeof(double),
-                cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(
+            finest.d_rhs,
+            d_fineResidual,
+            static_cast<size_t>(finest.numDOFs) * sizeof(double),
+            cudaMemcpyDeviceToDevice));
     }
 
+    // Exchange finest-level residual halos before the first restriction.
+    StreamData& finestStreams = comm_stream[G.deviceId];
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+    #pragma omp barrier
+
+    if (finest.right.neighborGPU >= 0)
+    {
+        const int neighbor = finest.right.neighborGPU;
+
+        sendOneSideHalo(
+            G.deviceId,
+            finest.right,
+            finest.d_rhs,
+            neighbor,
+            gpuData[neighbor].levels[0].d_rhs,
+            finestStreams.rightStream
+        );
+    }
+
+    if (finest.left.neighborGPU >= 0)
+    {
+        const int neighbor = finest.left.neighborGPU;
+
+        sendOneSideHalo(
+            G.deviceId,
+            finest.left,
+            finest.d_rhs,
+            neighbor,
+            gpuData[neighbor].levels[0].d_rhs,
+            finestStreams.leftStream
+        );
+    }
+
+    if (finest.right.neighborGPU >= 0)
+        CUDA_CHECK(cudaStreamSynchronize(finestStreams.rightStream));
+
+    if (finest.left.neighborGPU >= 0)
+        CUDA_CHECK(cudaStreamSynchronize(finestStreams.leftStream));
+
+    #pragma omp barrier
+
+    // Initialize all level corrections.
     for (int levelIndex = 0; levelIndex < G.numLevels; ++levelIndex)
     {
         Level& level = G.levels[levelIndex];
 
-        CUDA_CHECK(
-            cudaMemset(
-                level.d_x, 0,
-                static_cast<size_t>(level.numDOFs) * sizeof(double)));
-
+        CUDA_CHECK(cudaMemset(
+            level.d_x,
+            0,
+            static_cast<size_t>(level.numDOFs) * sizeof(double)));
     }
 
     // Restriction
@@ -2261,10 +2346,9 @@ static void applyVcycle(
     {
         solveCoarsest(
             G,
-            G.coarsestLevel.d_globalRHS,
-            G.coarsestLevel.d_globalX
+            globalCoarse.d_globalRHS,
+            globalCoarse.d_globalX
         );
-
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     // All OpenMP threads wait here.
@@ -2386,6 +2470,19 @@ static void applyVcycle(
         // proceeding to the next finer level.
         #pragma omp barrier
     }
+    // TODO---> fixed-DOF indices must be local to the current GPU, and your correction output convention should clearly specify whether ghost nodes are included. THis is valid for everytime this is called.
+    zeroFixedDOFs(G, finest.d_x);
+
+    if (d_fineCorrection != finest.d_x)
+    {
+        CUDA_CHECK(cudaMemcpy(
+            d_fineCorrection,
+            finest.d_x,
+            static_cast<size_t>(finest.numDOFs)
+                * sizeof(double),
+            cudaMemcpyDeviceToDevice
+        ));
+    }
 }
 
 __global__ void substractVectorsInPlaceKernel(
@@ -2451,41 +2548,6 @@ static void copyBoundaryToHalo(
         sourceId,
         static_cast<size_t>(numBoundaryNodes) * 3 * sizeof(double),
         stream));
-}
-
-static void sendOneSideHalo(
-    int sourceDeviceId,
-    HaloSide& S,
-    const double* d_src,
-    int neighborDeviceId,
-    double* d_dstNeighbor,
-    cudaStream_t stream)
-{
-    if (S.sendLocal.empty() || neighborDeviceId < 0)
-        return;
-
-    const int count = static_cast<int>(S.sendLocal.size());
-    const int grid = gridSizeFor(count, 256);
-
-    packHaloKernel<<<grid, 256, 0, stream>>>(
-        d_src,
-        S.d_sendLocal,
-        S.d_sendBuffer,
-        count
-    );
-    CUDA_CHECK(cudaGetLastError());
-
-    // Destination offset in the neighbor's buffer (MATLAB 1-based index)
-    const size_t offset = 3 * static_cast<size_t>(S.sendDestLocal[0] - 1);
-
-    copyBoundaryToHalo(
-        sourceDeviceId,
-        S.d_sendBuffer,
-        neighborDeviceId,
-        d_dstNeighbor + offset,
-        count,
-        stream
-    );
 }
 
 static void sendOneSideInterface(
@@ -2789,8 +2851,24 @@ static void runMGPCG(
     // z = M^{-1}r; p = z; rho = z'*r
     // Local to global
     // Each GPU should receive their portion of d_fineResidual
-    applyVcycle(solver, solver.d_r, solver.d_Ap);
+    #pragma omp parallel num_threads(numGPUs)
+    {
+        const int g = omp_get_thread_num();
 
+        CUDA_CHECK(cudaSetDevice(g));
+
+        singleGPUData& G = gpuData[g];
+
+        applyVcycle(
+            G,
+            G.d_r,
+            G.d_Ap,
+            gpuData,
+            comm_stream,
+            globalCoarse,
+            vcycleShared
+        );
+    }
     CUBLAS_CHECK(
         cublasDcopy(
             handle,

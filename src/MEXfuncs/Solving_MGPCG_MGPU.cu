@@ -1812,6 +1812,125 @@ static void zeroFixedDOFs(
     CUDA_CHECK(cudaGetLastError());
 }
 
+
+static double globalDotProduct(
+    singleGPUData& solver,
+    ncclComm_t comm,
+    const double* d_a,
+    const double* d_b)
+{
+    CUDA_CHECK(cudaSetDevice(solver.deviceId));
+
+    const int n = solver.levels[0].numDOFs;
+
+    // Step 1: Compute local dot product with cuBLAS.
+    double localDot = 0.0;
+
+    CUBLAS_CHECK(
+        cublasDdot(
+            solver.cublasHandle,
+            n,
+            d_a,
+            1,
+            d_b,
+            1,
+            &localDot));
+
+    // Step 2: Allocate device scalar for NCCL.
+    double* d_dot = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_dot, sizeof(double)));
+
+    CUDA_CHECK(cudaMemcpy(
+        d_dot,
+        &localDot,
+        sizeof(double),
+        cudaMemcpyHostToDevice));
+
+    // Step 3: Sum local dot products across all GPUs.
+    NCCL_CHECK(
+        ncclAllReduce(
+            d_dot,
+            d_dot,
+            1,
+            ncclDouble,
+            ncclSum,
+            comm,
+            0));
+
+    // Step 4: Retrieve global result on each GPU worker.
+    double globalDot = 0.0;
+
+    CUDA_CHECK(cudaMemcpy(
+        &globalDot,
+        d_dot,
+        sizeof(double),
+        cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaFree(d_dot));
+
+    return globalDot;
+}
+
+static void globalNorm(
+    double& residualNorm,
+    singleGPUData& solver,
+    ncclComm_t comm,
+    const double* d_r)
+{
+    CUDA_CHECK(cudaSetDevice(solver.deviceId));
+
+    const int n = solver.levels[0].numDOFs;
+
+    // Step 1: Compute local L2 norm.
+    double localNorm = 0.0;
+
+    CUBLAS_CHECK(
+        cublasDnrm2(
+            solver.cublasHandle,
+            n,
+            d_r,
+            1,
+            &localNorm));
+
+    // Step 2: Square the local norm.
+    double localSquaredNorm = localNorm * localNorm;
+
+    // Step 3: Allocate device scalar for NCCL.
+    double* d_norm = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_norm, sizeof(double)));
+
+    CUDA_CHECK(cudaMemcpy(
+        d_norm,
+        &localSquaredNorm,
+        sizeof(double),
+        cudaMemcpyHostToDevice));
+
+    // Step 4: Sum squared norms across all GPUs.
+    NCCL_CHECK(
+        ncclAllReduce(
+            d_norm,
+            d_norm,
+            1,
+            ncclDouble,
+            ncclSum,
+            comm,
+            0));
+
+    // Step 5: Copy global squared norm to host.
+    double globalSquaredNorm = 0.0;
+
+    CUDA_CHECK(cudaMemcpy(
+        &globalSquaredNorm,
+        d_norm,
+        sizeof(double),
+        cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaFree(d_norm));
+
+    // Step 6: Compute global L2 norm.
+    residualNorm = std::sqrt(globalSquaredNorm);
+}
+
 static void solveCoarsest(
     SingleGPUData& solver,
     const double* d_rhs,
@@ -2725,21 +2844,31 @@ static void runMGPCG(
 {
     std::vector<ncclComm_t> comms(numGPUs);
 
-
     const int plannedHostNumThreads = numGPUs;
     const int cpu_cores = omp_get_num_procs();
     mexPrintf("CPU logical threads available: %d\n", cpu_cores);
     omp_set_dynamic(0);
     omp_set_num_threads(plannedHostNumThreads);
 
+    #pragma unroll
     for (auto& s : solver)
     {
-        if (!s.initialized || s.levels.empty() || s.cublasHandle == nullptr)
+        if (!s.initialized || s.levels.empty())
         {
             throw std::runtime_error("The solver context is not fully initialized.");
         }
+        if (s.deviceId < 0 || s.deviceId >= numGPUs)
+        {
+            throw std::runtime_error("Invalid device ID in solver context.");
+        }
+        if (s.deviceId == 0 && s.cublasHandle == nullptr)
+        {
+            throw std::runtime_error("CUBLAS handle is not initialized for device 0.");
+        }
+
     }
     
+    #pragma unroll
     for (int i = 0; i < numGPUs; ++i) {
         CUDA_CHECK(cudaSetDevice(gpuData[i].deviceId));
         int leastPriority = 0, greatestPriority = 0;
@@ -2757,8 +2886,9 @@ static void runMGPCG(
                 &comm_stream[i].rightStream, cudaStreamNonBlocking, priority));
         }
     }
-
+    #pragma omp parallel for schedule(static, 1) num_threads(numGPUs)
     for (int i = 0; i < numGPUs; ++i) {
+        CUDA_CHECK(cudaSetDevice(gpuData[i].deviceId));
         singleGPUData& solver = gpuData[i];
         solver.iterations = 0;
         solver.relativeResidual = 0.0;
@@ -2768,7 +2898,6 @@ static void runMGPCG(
         zeroFixedDOFs(solver, solver.d_y);
     }
     
-    const int n = solver.levels[0].numDOFs;
 
     //cublasHandle_t handle = solver.cublasHandle;
 
@@ -2776,15 +2905,30 @@ static void runMGPCG(
     const double minusOne = -1.0;
 
     double normB = 0.0;
-    
-    // Global op
-    CUBLAS_CHECK(
-        cublasDnrm2(
-            handle,
-            n,
-            solver.d_r,
-            1,
-            &normB));
+
+    #pragma omp parallel num_threads(numGPUs)
+    {
+        const int g = omp_get_thread_num();
+        singleGPUData& solver = gpuData[g];
+
+        CUDA_CHECK(cudaSetDevice(solver.deviceId));
+
+        double localResult = 0.0;
+
+        globalNorm(
+            localResult,
+            solver,
+            comms[g],
+            solver.d_r
+        );
+
+        // Every GPU receives the same global norm.
+        // Only one thread writes to the shared variable.
+        #pragma omp single
+        {
+            normB = localResult;
+        }
+    }
 
     // r = b - A*y
     #pragma omp parallel num_threads(numGPUs)
@@ -2792,6 +2936,7 @@ static void runMGPCG(
         int g = omp_get_thread_num();
         singleGPUData& solver = gpuData[g];
         CUDA_CHECK(cudaSetDevice(g));
+        const int n = solver.levels[0].numDOFs;
 
         applyFinestOperator(
             gpuData[g],
@@ -2819,14 +2964,13 @@ static void runMGPCG(
 
     double residualNorm = 0.0;
     
-    //Global op
-    CUBLAS_CHECK(
-        cublasDnrm2(
-            handle,
-            n,
-            solver.d_r,
-            1,
-            &residualNorm));
+    // Global L2 norm across all GPUs
+    globalNorm(
+        residualNorm,
+        solver,
+        comms[g],
+        solver.d_r
+    );
 
     const double residualDenominator = (normB > 0.0) ? normB : 1.0;
     double relativeResidual = residualNorm / residualDenominator;
@@ -2869,6 +3013,7 @@ static void runMGPCG(
             vcycleShared
         );
     }
+    // What kind of op?
     CUBLAS_CHECK(
         cublasDcopy(
             handle,
@@ -2879,7 +3024,7 @@ static void runMGPCG(
             1));
 
     double rho = 0.0;
-
+    // What kind of op?
     CUBLAS_CHECK(
         cublasDdot(
             handle,
@@ -2897,168 +3042,172 @@ static void runMGPCG(
     #pragma omp barrier
     // Start the main PCG iteration loop.
     nvtxRangePushA("MGPCG:mainLoop");
-    for (int its = 1; its <= solver.maxIterations; ++its)
+    #pragma omp parallel num_threads(numGPUs)
     {
-        nvtxRangePushA("MGPCG:applyFinestOperator");
-        applyFinestOperator(solver, solver.d_p, solver.d_Ap);
-        nvtxRangePop();
-        double pAp = 0.0;
+        const int g = omp_get_thread_num();
 
-        // Global op
-        CUBLAS_CHECK(
-            cublasDdot(
-                handle,
-                n,
+        singleGPUData& solver = gpuData[g];
+
+        CUDA_CHECK(cudaSetDevice(solver.deviceId));
+
+        const int n = solver.levels[0].numDOFs;
+        cublasHandle_t handle = solver.cublasHandle;
+
+        for (int its = 1; its <= solver.maxIterations; ++its)
+        {
+            applyFinestOperator(
+                solver,
                 solver.d_p,
-                1,
-                solver.d_Ap,
-                1,
-                &pAp));
-
-        if (!std::isfinite(pAp) || pAp <= 0.0)
-        {
-            char message[512];
-            std::snprintf(
-                message,
-                sizeof(message),
-                "PCG breakdown at iteration %d: p'*A*p is non-positive or non-finite.",
-                its);
-            throw std::runtime_error(message);
-        }
-
-        const double alpha = rho / pAp;
-
-        if (!std::isfinite(alpha))
-        {
-            throw std::runtime_error("PCG breakdown: alpha is not finite.");
-        }
-
-        const double minusAlpha = -alpha;
-
-        // Local op
-        CUBLAS_CHECK(
-            cublasDaxpy(
-                handle,
-                n,
-                &alpha,
-                solver.d_p,
-                1,
-                solver.d_y,
-                1));
-        
-        // Local op
-        CUBLAS_CHECK(
-            cublasDaxpy(
-                handle,
-                n,
-                &minusAlpha,
-                solver.d_Ap,
-                1,
-                solver.d_r,
-                1));
-
-        // Zeroes out the entries corresponding to fixed degrees of freedom
-        zeroFixedDOFs(solver, solver.d_y);
-        zeroFixedDOFs(solver, solver.d_r);
-        
-        // Global op
-        CUBLAS_CHECK(
-            cublasDnrm2(
-                handle,
-                n,
-                solver.d_r,
-                1,
-                &residualNorm));
-
-        solver.iterations = its;
-        solver.relativeResidual = residualNorm / residualDenominator;
-
-        if (!std::isfinite(solver.relativeResidual))
-        {
-            throw std::runtime_error("PCG produced a non-finite relative residual.");
-        }
-
-        if (solver.relativeResidual < solver.tolerance)
-        {
-            solver.converged = true;
-
-            MEX_PRINT("CG solver converged at iteration %d with relative residual %.6e",
-                its,
-                solver.relativeResidual);
-            break;
-        }
-        nvtxRangePushA("MGPCG:applyVcycle2");
-        #pragma omp parallel num_threads(numGPUs)
-        {
-            const int g = omp_get_thread_num();
-
-            CUDA_CHECK(cudaSetDevice(g));
-
-            singleGPUData& G = gpuData[g];
-
-            applyVcycle(
-                G,
-                G.d_r,
-                G.d_Ap,
-                gpuData,
-                comm_stream,
-                globalCoarse,
-                vcycleShared
+                solver.d_Ap
             );
-        }      
-        double rhoNew = 0.0;
 
-        // Global op
-        CUBLAS_CHECK(
-            cublasDdot(
-                handle,
-                n,
-                solver.d_Ap,
-                1,
-                solver.d_r,
-                1,
-                &rhoNew));
-
-        if (!std::isfinite(rhoNew) || rhoNew <= 0.0)
-        {
-            char message[512];
-            std::snprintf(
-                message,
-                sizeof(message),
-                "PCG breakdown at iteration %d: z'*r is non-positive or non-finite.",
-                its);
-            throw std::runtime_error(message);
-        }
-
-        const double beta = rhoNew / rho;
-
-        if (!std::isfinite(beta))
-        {
-            throw std::runtime_error("PCG breakdown: beta is not finite.");
-        }
-
-        // p = z + beta*p
-        // Local op
-        CUBLAS_CHECK(
-            cublasDscal(
-                handle,
-                n,
-                &beta,
+            // Global dot product across all GPUs.
+            double pAp = globalDotProduct(
+                solver,
+                comms[g],
                 solver.d_p,
-                1));
-        
-        // Local op
-        CUBLAS_CHECK(
-            cublasDaxpy(
-                handle,
-                n,
-                &one,
-                solver.d_Ap,
-                1,
-                solver.d_p,
-                1));
+                solver.d_Ap
+            );
 
-        rho = rhoNew;
+            if (!std::isfinite(pAp) || pAp <= 0.0)
+            {
+                char message[512];
+                std::snprintf(
+                    message,
+                    sizeof(message),
+                    "PCG breakdown at iteration %d: p'*A*p is non-positive or non-finite.",
+                    its);
+                throw std::runtime_error(message);
+            }
+
+            const double alpha = rho / pAp;
+
+            if (!std::isfinite(alpha))
+            {
+                throw std::runtime_error("PCG breakdown: alpha is not finite.");
+            }
+
+            const double minusAlpha = -alpha;
+
+            // Local op
+            CUBLAS_CHECK(
+                cublasDaxpy(
+                    handle,
+                    n,
+                    &alpha,
+                    solver.d_p,
+                    1,
+                    solver.d_y,
+                    1));
+            
+            // Local op
+            CUBLAS_CHECK(
+                cublasDaxpy(
+                    handle,
+                    n,
+                    &minusAlpha,
+                    solver.d_Ap,
+                    1,
+                    solver.d_r,
+                    1));
+
+            // Zeroes out the entries corresponding to fixed degrees of freedom
+            zeroFixedDOFs(solver, solver.d_y);
+            zeroFixedDOFs(solver, solver.d_r);
+            
+            // Global L2 norm across all GPUs.
+            globalNorm(
+                residualNorm,
+                solver,
+                comms[g],
+                solver.d_r
+            );
+
+            solver.iterations = its;
+            solver.relativeResidual = residualNorm / residualDenominator;
+
+            if (!std::isfinite(solver.relativeResidual))
+            {
+                throw std::runtime_error("PCG produced a non-finite relative residual.");
+            }
+
+            if (solver.relativeResidual < solver.tolerance)
+            {
+                solver.converged = true;
+
+                MEX_PRINT("CG solver converged at iteration %d with relative residual %.6e",
+                    its,
+                    solver.relativeResidual);
+                break;
+            }
+            nvtxRangePushA("MGPCG:applyVcycle2");
+            #pragma omp parallel num_threads(numGPUs)
+            {
+                const int g = omp_get_thread_num();
+
+                CUDA_CHECK(cudaSetDevice(g));
+
+                singleGPUData& G = gpuData[g];
+
+                applyVcycle(
+                    G,
+                    G.d_r,
+                    G.d_Ap,
+                    gpuData,
+                    comm_stream,
+                    globalCoarse,
+                    vcycleShared
+                );
+            }
+
+            double rhoNew = globalDotProduct(
+                solver,
+                comms[g],
+                solver.d_Ap,
+                solver.d_r
+            );
+
+            if (!std::isfinite(rhoNew) || rhoNew <= 0.0)
+            {
+                char message[512];
+                std::snprintf(
+                    message,
+                    sizeof(message),
+                    "PCG breakdown at iteration %d: z'*r is non-positive or non-finite.",
+                    its);
+                throw std::runtime_error(message);
+            }
+
+            const double beta = rhoNew / rho;
+
+            if (!std::isfinite(beta))
+            {
+                throw std::runtime_error("PCG breakdown: beta is not finite.");
+            }
+
+            // p = z + beta*p
+            // Local op
+            CUBLAS_CHECK(
+                cublasDscal(
+                    handle,
+                    n,
+                    &beta,
+                    solver.d_p,
+                    1));
+            
+            // Local op
+            CUBLAS_CHECK(
+                cublasDaxpy(
+                    handle,
+                    n,
+                    &one,
+                    solver.d_Ap,
+                    1,
+                    solver.d_p,
+                    1));
+
+            rho = rhoNew;
+        }
     }
 
     nvtxRangePop();

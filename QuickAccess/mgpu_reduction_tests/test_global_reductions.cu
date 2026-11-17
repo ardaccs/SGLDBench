@@ -54,7 +54,7 @@ static double globalDotProduct(singleGPUData& solver, ncclComm_t comm,
 
     #pragma omp barrier
 
-    NCCL_OK(ncclAllReduce(
+    ncclResult_t status = ncclAllReduce(
         d_dot,
         d_dot,
         1,
@@ -62,8 +62,20 @@ static double globalDotProduct(singleGPUData& solver, ncclComm_t comm,
         ncclSum,
         comm,
         ncclStream
-    ));
+    );
 
+    if (status != ncclSuccess)
+    {
+        fprintf(stderr,
+            "[GPU %d] NCCL AllReduce failed\n"
+            "  Error: %s\n"
+            "  Details: %s\n",
+            solver.deviceId,
+            ncclGetErrorString(status),
+            ncclGetLastError(comm));
+
+        std::abort();
+    }
     CUDA_OK(cudaStreamSynchronize(ncclStream));
 
     // Retrieve global result.

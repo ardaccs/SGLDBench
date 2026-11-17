@@ -25,19 +25,44 @@ static double globalDotProduct(singleGPUData& solver, ncclComm_t comm,
                                cudaStream_t ncclStream, const double* d_a,
                                const double* d_b) {
     CUDA_OK(cudaSetDevice(solver.deviceId));
+
     const Level& fine = solver.levels[0];
-    const int offset = 3*fine.numLeftSharedNodes;
-    const int ownedDOFs = fine.numDOFs-offset;
+    const int offset = 3 * fine.numLeftSharedNodes;
+    const int ownedDOFs = fine.numDOFs - offset;
+
     double localDot = 0.0;
-    BLAS_OK(cublasDdot(solver.handle, ownedDOFs, d_a+offset, 1,
-                       d_b+offset, 1, &localDot));
-    double* d_dot=nullptr;
-    CUDA_OK(cudaMalloc(&d_dot,sizeof(double)));
-    CUDA_OK(cudaMemcpyAsync(d_dot,&localDot,sizeof(double),cudaMemcpyHostToDevice,ncclStream));
-    NCCL_OK(ncclAllReduce(d_dot,d_dot,1,ncclDouble,ncclSum,comm,ncclStream));
-    double globalDot=0.0;
-    // Blocking cudaMemcpy on the default stream is not used to establish
-    // ordering with a different NCCL stream. Explicitly synchronize instead.
+
+    BLAS_OK(cublasDdot(
+        solver.handle,
+        ownedDOFs,
+        d_a + offset,
+        1,
+        d_b + offset,
+        1,
+        &localDot));
+
+    double* d_dot = nullptr;
+    CUDA_OK(cudaMalloc(&d_dot, sizeof(double)));
+
+    CUDA_OK(cudaMemcpy(
+        d_dot,
+        &localDot,
+        sizeof(double),
+        cudaMemcpyHostToDevice));
+
+    CUDA_OK(cudaDeviceSynchronize());
+
+    #pragma omp barrier
+
+    NCCL_OK(ncclAllReduce(
+        d_dot,
+        d_dot,
+        1,
+        ncclDouble,
+        ncclSum,
+        comm,
+        ncclStream));
+
     CUDA_OK(cudaStreamSynchronize(ncclStream));
     CUDA_OK(cudaMemcpy(&globalDot,d_dot,sizeof(double),cudaMemcpyDeviceToHost));
     CUDA_OK(cudaFree(d_dot));

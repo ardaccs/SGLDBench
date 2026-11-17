@@ -151,6 +151,40 @@ struct InterfaceSide
     double* d_recvBuffer = nullptr;
 };
 
+struct coarsestLevelData
+{
+    int numCoarseFreeDOFs = 0;
+    int coarseNNZ = 0;
+
+    const int32_t* h_coarseRowPtr = nullptr;
+    const int32_t* h_coarseColInd = nullptr;
+    const double* h_coarseValues = nullptr;
+
+    int32_t* d_coarseRowPtr = nullptr;
+    int32_t* d_coarseColInd = nullptr;
+    double* d_coarseValues = nullptr;
+
+    double* d_coarseRHS = nullptr;
+    double* d_coarseX = nullptr;
+
+    cudssHandle_t d_cudssHandle = nullptr;
+
+    // All allocated on GPU 0.
+    std::vector<double*> d_recvResidual;
+    std::vector<double*> d_sendResidual;
+    std::vector<int32_t*> d_globalNodeIds;
+    std::vector<int32_t*> d_localNodeIds;
+
+    // Number of normal local coarse nodes per GPU.
+    std::vector<int> localNodeCounts;
+
+    // Full global coarse vectors on GPU 0.
+    double* d_globalRHS = nullptr;
+    double* d_globalX = nullptr;
+
+    int globalNumDOFs = 0;
+};
+
 // C++ level 0 corresponds to MATLAB meshHierarchy_(1).
 struct Level
 {
@@ -161,6 +195,7 @@ struct Level
     int numElements = 0;
     int numDOFs = 0;
     size_t numGridNodes = 0;
+    int numLeftSharedNodes = 0;
 
     // MATLAB-owned host data; pointers are valid during this MEX call.
     const int32_t* h_nodeToElements = nullptr;
@@ -170,6 +205,7 @@ struct Level
     const int32_t* h_sharedNodesLocal = nullptr;
     const double* h_eleModulus = nullptr;
     const double* h_dK = nullptr;
+    const uint8_t* h_ownedNodeMask = nullptr;
 
     // Device hierarchy data. This operation only needs the geometry maps.
     int32_t* d_nodeToElements = nullptr;
@@ -179,6 +215,7 @@ struct Level
     int32_t* d_sharedNodesLocal = nullptr;
     double* d_eleModulus = nullptr;
     double* d_dK = nullptr;
+    uint8_t* d_ownedNodeMask = nullptr;
 
     // Partition information and per-call vectors.
     const int32_t* h_globalNodeIds = nullptr;
@@ -234,42 +271,45 @@ struct singleGPUData
     // Data for coarsest level solve using cuDSS. 
     coarsetLevelData coarsestLevel;
 };
-
-struct coarsestLevelData
+__global__ void ownedDotPartialKernel(
+    const double* __restrict__ a,
+    const double* __restrict__ b,
+    const uint8_t* __restrict__ ownedMask,
+    double* __restrict__ partial,
+    int numNodes)
 {
-    int numCoarseFreeDOFs = 0;
-    int coarseNNZ = 0;
+    extern __shared__ double sums[];
 
-    const int32_t* h_coarseRowPtr = nullptr;
-    const int32_t* h_coarseColInd = nullptr;
-    const double* h_coarseValues = nullptr;
+    const int tid = threadIdx.x;
+    const int index = blockIdx.x * blockDim.x + tid;
 
-    int32_t* d_coarseRowPtr = nullptr;
-    int32_t* d_coarseColInd = nullptr;
-    double* d_coarseValues = nullptr;
+    double sum = 0.0;
 
-    double* d_coarseRHS = nullptr;
-    double* d_coarseX = nullptr;
+    if (index < numNodes && ownedMask[index])
+    {
+        const int base = 3 * index;
 
-    cudssHandle_t d_cudssHandle = nullptr;
+        sum = a[base]     * b[base]
+            + a[base + 1] * b[base + 1]
+            + a[base + 2] * b[base + 2];
+    }
 
-    // All allocated on GPU 0.
-    std::vector<double*> d_recvResidual;
-    std::vector<double*> d_sendResidual;
-    std::vector<int32_t*> d_globalNodeIds;
-    std::vector<int32_t*> d_localNodeIds;
+    sums[tid] = sum;
+    __syncthreads();
 
-    // Number of normal local coarse nodes per GPU.
-    std::vector<int> localNodeCounts;
+    for (int stride = blockDim.x / 2;
+         stride > 0;
+         stride /= 2)
+    {
+        if (tid < stride)
+            sums[tid] += sums[tid + stride];
 
-    // Full global coarse vectors on GPU 0.
-    double* d_globalRHS = nullptr;
-    double* d_globalX = nullptr;
+        __syncthreads();
+    }
 
-    int globalNumDOFs = 0;
-};
-
-
+    if (tid == 0)
+        partial[blockIdx.x] = sums[0];
+}
 __global__ void zeroSelectedDOFsKernel(
     double* vector,
     const int32_t* fixedDOFIds,
@@ -1042,744 +1082,15 @@ static size_t calculateRequiredGPUBytes(
     return bytes;
 }
 
-static void initializeGPUHierarchy(
-    SolverContext& solver,
-    const mxArray* hierarchyMx,
-    const mxArray* bMx,
-    const mxArray* yMx,
-    double tolerance,
-    int maxIterations)
+static void initializeGPUHierarchy()
 {
-    if (hierarchyMx == nullptr ||!mxIsStruct(hierarchyMx) ||mxGetNumberOfElements(hierarchyMx) != 1)
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:hierarchy",
-            "H must be a scalar MATLAB struct.");
-    }
-
-    if (!mxIsDouble(bMx) ||mxIsComplex(bMx) ||!mxIsDouble(yMx) ||mxIsComplex(yMx))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:inputType",
-            "b and y0 must be real double arrays.");
-    }
-
-    if (!std::isfinite(tolerance) || tolerance <= 0.0)
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:tolerance",
-            "tolerance must be finite and positive.");
-    }
-
-    if (maxIterations <= 0)
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:maxIterations",
-            "maxIterations must be a positive integer.");
-    }
-
-    const int numLevels =
-        readPositiveIntegerScalar(
-            requireField(hierarchyMx, "numLevels"),
-            "H.numLevels");
-
-    if (numLevels < 2)
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:numLevels",
-            "At least two multigrid levels are required.");
-    }
-
-    const mxArray* resXField = requireField(hierarchyMx, "resX");
-    const mxArray* resYField = requireField(hierarchyMx, "resY");
-    const mxArray* resZField = requireField(hierarchyMx, "resZ");
-    const mxArray* numNodesField = requireField(hierarchyMx, "numNodes");
-    const mxArray* numElementsField = requireField(hierarchyMx, "numElements");
-    const mxArray* numDOFsField = requireField(hierarchyMx, "numDOFs");
-    const mxArray* spanWidthField = requireField(hierarchyMx, "spanWidth");
-
-    requireInt32Array(resXField,static_cast<mwSize>(numLevels),"H.resX");
-    requireInt32Array(resYField,static_cast<mwSize>(numLevels),"H.resY");
-    requireInt32Array(resZField,static_cast<mwSize>(numLevels),"H.resZ");
-    requireInt32Array(numNodesField,static_cast<mwSize>(numLevels),"H.numNodes");
-    requireInt32Array(numElementsField,static_cast<mwSize>(numLevels),"H.numElements");
-    requireInt32Array(numDOFsField,static_cast<mwSize>(numLevels),"H.numDOFs");
-    requireInt32Array(spanWidthField,static_cast<mwSize>(numLevels - 1),"H.spanWidth");
-
-    const int32_t* resX = static_cast<const int32_t*>(mxGetData(resXField));
-    const int32_t* resY = static_cast<const int32_t*>(mxGetData(resYField));
-    const int32_t* resZ = static_cast<const int32_t*>(mxGetData(resZField));
-    const int32_t* numNodes = static_cast<const int32_t*>(mxGetData(numNodesField));
-    const int32_t* numElements = static_cast<const int32_t*>(mxGetData(numElementsField));
-    const int32_t* numDOFs = static_cast<const int32_t*>(mxGetData(numDOFsField));
-    const int32_t* spanWidth = static_cast<const int32_t*>(mxGetData(spanWidthField));
-
-    const mxArray* nodeToElementsField = requireField(hierarchyMx, "nodeToElements");
-    const mxArray* eNodMatField = requireField(hierarchyMx, "eNodMat");
-    const mxArray* nodGridIdField = requireField(hierarchyMx, "nodGridId");
-    const mxArray* nodMapForwardField = requireField(hierarchyMx, "nodMapForward");
-    const mxArray* eleModulusField = requireField(hierarchyMx, "eleModulus");
-    const mxArray* diagKField = requireField(hierarchyMx, "diagK");
-
-    if (!mxIsCell(nodeToElementsField) ||
-        mxGetNumberOfElements(nodeToElementsField) < static_cast<mwSize>(numLevels) ||
-        !mxIsCell(eNodMatField) ||
-        mxGetNumberOfElements(eNodMatField) < static_cast<mwSize>(numLevels) ||
-        !mxIsCell(nodGridIdField) ||
-        mxGetNumberOfElements(nodGridIdField) < static_cast<mwSize>(numLevels) ||
-        !mxIsCell(nodMapForwardField) ||
-        mxGetNumberOfElements(nodMapForwardField) < static_cast<mwSize>(numLevels) ||
-        !mxIsCell(eleModulusField) ||
-        mxGetNumberOfElements(eleModulusField) < 1 ||
-        !mxIsCell(diagKField) ||
-        mxGetNumberOfElements(diagKField) < static_cast<mwSize>(numLevels - 1))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:hierarchyCells",
-            "Hierarchy cell fields do not contain the required number of levels.");
-    }
-
-    const mxArray* jacobiOmegaMx = mxGetField(hierarchyMx, 0, "jacobiOmega");
-
-    if (jacobiOmegaMx == nullptr)
-        jacobiOmegaMx = mxGetField(hierarchyMx, 0, "weightFactorJacobi");
-
-    if (jacobiOmegaMx == nullptr ||
-        !mxIsDouble(jacobiOmegaMx) ||
-        mxIsComplex(jacobiOmegaMx) ||
-        mxGetNumberOfElements(jacobiOmegaMx) != 1)
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:jacobiOmega",
-            "H must contain scalar jacobiOmega or weightFactorJacobi.");
-    }
-
-    const double jacobiOmega = mxGetScalar(jacobiOmegaMx);
-
-    if (!std::isfinite(jacobiOmega))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:jacobiOmega",
-            "The Jacobi weight must be finite.");
-    }
-
-    solver.initialized = false;
-    solver.numLevels = numLevels;
-    solver.levels.assign(static_cast<size_t>(numLevels),Level{});
-    solver.spanWidths.resize(static_cast<size_t>(numLevels - 1));
-
-    solver.tolerance = tolerance;
-    solver.maxIterations = maxIterations;
-    solver.jacobiOmega = jacobiOmega;
-    solver.h_b =static_cast<const double*>(mxGetData(bMx));
-    solver.h_y =static_cast<const double*>(mxGetData(yMx));
-    solver.outputRows = mxGetM(bMx);
-    solver.outputCols = mxGetN(bMx);
-
-    for (int levelIndex = 0;levelIndex < numLevels;++levelIndex)
-    {
-        Level& level =
-            solver.levels[levelIndex];
-
-        level.nx = static_cast<int>(resX[levelIndex]);
-        level.ny = static_cast<int>(resY[levelIndex]);
-        level.nz = static_cast<int>(resZ[levelIndex]);
-        level.numNodes =static_cast<int>(numNodes[levelIndex]);
-        level.numElements =static_cast<int>(numElements[levelIndex]);
-        level.numDOFs =static_cast<int>(numDOFs[levelIndex]);
-
-        if (level.nx < 0 ||
-            level.ny < 0 ||
-            level.nz < 0 ||
-            level.numNodes <= 0 ||
-            level.numElements <= 0 ||
-            level.numDOFs <= 0)
-        {
-            mexErrMsgIdAndTxt(
-                "mgpcg_gpu:levelDimensions",
-                "Hierarchy level %d contains invalid dimensions or counts.",
-                levelIndex + 1);
-        }
-
-        if (level.numDOFs != 3 * level.numNodes)
-        {
-            mexErrMsgIdAndTxt(
-                "mgpcg_gpu:numDOFs",
-                "H.numDOFs(%d) must equal 3*H.numNodes(%d).",
-                levelIndex + 1,
-                levelIndex + 1);
-        }
-
-        const size_t nyNodes =static_cast<size_t>(level.ny) + 1;
-        const size_t nxNodes =static_cast<size_t>(level.nx) + 1;
-        const size_t nzNodes =static_cast<size_t>(level.nz) + 1;
-
-        level.numGridNodes =checkedMultiply(checkedMultiply(nyNodes, nxNodes),nzNodes);
-
-        if (level.numGridNodes >
-            static_cast<size_t>(INT_MAX))
-        {
-            mexErrMsgIdAndTxt(
-                "mgpcg_gpu:gridIndexRange",
-                "Hierarchy level %d has more grid nodes than the int-based transfer kernels support.",
-                levelIndex + 1);
-        }
-
-        const mxArray* nodeToElementsMx = requireCellEntry(nodeToElementsField,static_cast<mwIndex>(levelIndex),"nodeToElements");
-        const mxArray* eNodMatMx = requireCellEntry(eNodMatField,static_cast<mwIndex>(levelIndex),"eNodMat");
-        const mxArray* nodGridIdMx = requireCellEntry(nodGridIdField,static_cast<mwIndex>(levelIndex),"nodGridId");
-        const mxArray* nodMapForwardMx = requireCellEntry(nodMapForwardField,static_cast<mwIndex>(levelIndex),"nodMapForward");
-
-        requireInt32Array(nodeToElementsMx,static_cast<mwSize>(level.numNodes) * 8,"H.nodeToElements{level}");
-        requireInt32Array(eNodMatMx,static_cast<mwSize>(level.numElements) * 8,"H.eNodMat{level}");
-        requireInt32Array(nodGridIdMx,static_cast<mwSize>(level.numNodes),"H.nodGridId{level}");
-        requireInt32Array(nodMapForwardMx,static_cast<mwSize>(level.numGridNodes),"H.nodMapForward{level}");
-
-        level.h_nodeToElements = static_cast<const int32_t*>(mxGetData(nodeToElementsMx));
-        level.h_eNodMat = static_cast<const int32_t*>(mxGetData(eNodMatMx));
-        level.h_nodGridId = static_cast<const int32_t*>(mxGetData(nodGridIdMx));
-        level.h_nodMapForward = static_cast<const int32_t*>(mxGetData(nodMapForwardMx));
-
-        validateOneBasedIds(
-            level.h_nodGridId,
-            level.numNodes,
-            static_cast<int>(level.numGridNodes),
-            false,
-            "H.nodGridId{level}");
-
-        validateOneBasedIds(
-            level.h_nodMapForward,
-            static_cast<int>(level.numGridNodes),
-            level.numNodes,
-            true,
-            "H.nodMapForward{level}");
-
-        if (levelIndex < numLevels - 1)
-        {
-            const mxArray* diagKMx =
-                requireCellEntry(diagKField,static_cast<mwIndex>(levelIndex),"diagK");
-
-            requireRealDoubleArray(diagKMx,static_cast<mwSize>(level.numDOFs),"H.diagK{level}");
-
-            level.h_dK = static_cast<const double*>(mxGetData(diagKMx));
-
-            for (int dof = 0;dof < level.numDOFs;++dof)
-            {
-                if (!std::isfinite(level.h_dK[dof]) ||level.h_dK[dof] == 0.0)
-                {
-                    mexErrMsgIdAndTxt(
-                        "mgpcg_gpu:diagK",
-                        "H.diagK{%d} contains a zero or non-finite value at entry %d.",
-                        levelIndex + 1,
-                        dof + 1);
-                }
-            }
-
-            const int width = static_cast<int>(spanWidth[levelIndex]);
-
-            if (width <= 0)
-            {
-                mexErrMsgIdAndTxt(
-                    "mgpcg_gpu:spanWidth",
-                    "H.spanWidth(%d) must be positive.",
-                    levelIndex + 1);
-            }
-
-            solver.spanWidths[levelIndex] = width;
-        }
-    }
-
-    const mxArray* eleModulusMx = requireCellEntry(eleModulusField,0,"eleModulus");
-
-    requireRealDoubleArray(eleModulusMx,static_cast<mwSize>(solver.levels[0].numElements),"H.eleModulus{1}");
-
-    solver.levels[0].h_eleModulus = static_cast<const double*>(mxGetData(eleModulusMx));
-
-    // The unchanged K-by-U kernel relies on valid one-based connectivity.
-    validateOneBasedIds(
-        solver.levels[0].h_nodeToElements,
-        static_cast<size_t>(solver.levels[0].numNodes) * 8,
-        solver.levels[0].numElements,
-        true,
-        "H.nodeToElements{1}");
-
-    validateOneBasedIds(
-        solver.levels[0].h_eNodMat,
-        static_cast<size_t>(solver.levels[0].numElements) * 8,
-        solver.levels[0].numNodes,
-        false,
-        "H.eNodMat{1}");
-
-    const mxArray* fixedDOFIdsMx = requireField(hierarchyMx, "fixedDOFIds");
-
-    if (!mxIsInt32(fixedDOFIdsMx) || mxIsComplex(fixedDOFIdsMx) || mxGetNumberOfElements(fixedDOFIdsMx) > static_cast<mwSize>(INT_MAX))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:fixedDOFIds",
-            "H.fixedDOFIds must be an int32 array with at most INT_MAX entries.");
-    }
-
-    solver.h_fixedDOFIds = static_cast<const int32_t*>(mxGetData(fixedDOFIdsMx));
-    solver.numFixedDOFs = static_cast<int>(mxGetNumberOfElements(fixedDOFIdsMx));
-
-    if (solver.numFixedDOFs > 0)
-    {
-        validateOneBasedIds(
-            solver.h_fixedDOFIds,
-            solver.numFixedDOFs,
-            solver.levels[0].numDOFs,
-            false,
-            "H.fixedDOFIds");
-    }
-
-    const mxArray* coarseFreeDOFIdsMx = requireField(hierarchyMx, "coarseFreeDOFIds");
-
-    if (!mxIsInt32(coarseFreeDOFIdsMx) ||
-        mxIsComplex(coarseFreeDOFIdsMx) ||
-        mxGetNumberOfElements(coarseFreeDOFIdsMx) == 0 ||
-        mxGetNumberOfElements(coarseFreeDOFIdsMx) >
-            static_cast<mwSize>(INT_MAX))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:coarseFreeDOFIds",
-            "H.coarseFreeDOFIds must be a nonempty int32 array with at most INT_MAX entries.");
-    }
-
-    solver.h_coarseFreeDOFIds = static_cast<const int32_t*>( mxGetData(coarseFreeDOFIdsMx));
-    solver.numCoarseFreeDOFs = static_cast<int>(mxGetNumberOfElements(coarseFreeDOFIdsMx));
-
-    validateOneBasedIds(
-        solver.h_coarseFreeDOFIds,
-        solver.numCoarseFreeDOFs,
-        solver.levels.back().numDOFs,
-        false,
-        "H.coarseFreeDOFIds");
-
-    const mxArray* keMx = requireField(hierarchyMx, "Ke");
-
-    requireRealDoubleArray(keMx,24 * 24, "H.Ke");
-
-    solver.h_Ke =static_cast<const double*>(mxGetData(keMx));
-
-    if (mxGetNumberOfElements(bMx) !=static_cast<mwSize>(solver.levels[0].numDOFs) ||mxGetNumberOfElements(yMx) !=static_cast<mwSize>(solver.levels[0].numDOFs))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:vectorSize",
-            "b and y0 must contain finest-level numDOFs entries.");
-    }
-
-    const mxArray* coarseKFreeMx = requireField(hierarchyMx, "coarseKFree");
-
-    if (!mxIsSparse(coarseKFreeMx) || !mxIsDouble(coarseKFreeMx) || mxIsComplex(coarseKFreeMx))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:coarseKFree",
-            "H.coarseKFree must be a real sparse double matrix.");
-    }
-
-    const mwSize coarseRows = mxGetM(coarseKFreeMx);
-    const mwSize coarseCols = mxGetN(coarseKFreeMx);
-
-    if (coarseRows != coarseCols || coarseRows != static_cast<mwSize>(solver.numCoarseFreeDOFs))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:coarseKFreeSize",
-            "H.coarseKFree must be numCoarseFreeDOFs-by-numCoarseFreeDOFs.");
-    }
-
-    const mwIndex* jc = mxGetJc(coarseKFreeMx);
-    const mwIndex* ir = mxGetIr(coarseKFreeMx);
-    const mwIndex nnz = jc[coarseCols];
-
-    if (coarseRows > static_cast<mwSize>(INT_MAX) || nnz > static_cast<mwIndex>(INT_MAX))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:coarseKFreeIndexRange",
-            "H.coarseKFree exceeds the int32 CSR limits used by this implementation.");
-    }
-
-    solver.h_coarseRowOffsets.resize(static_cast<size_t>(coarseRows) + 1);
-    solver.h_coarseColIndices.resize(static_cast<size_t>(nnz));
-
-    for (mwSize i = 0; i <= coarseRows; ++i)
-    {
-        solver.h_coarseRowOffsets[i] = static_cast<int32_t>(jc[i]);
-    }
-
-    for (mwIndex i = 0; i < nnz; ++i)
-    {
-        solver.h_coarseColIndices[i] = static_cast<int32_t>(ir[i]);
-    }
-
-    solver.h_coarseValues = static_cast<const double*>(mxGetData(coarseKFreeMx));
-    solver.coarseNNZ = static_cast<int64_t>(nnz);
-    solver.size = calculateRequiredGPUBytes(solver);
 }
 
 static void initializeCoarseSolver(
     SolverContext& solver);
 
-static void initializeGPU(
-    SolverContext& solver)
+static void initializeGPUs()
 {
-    CUDA_CHECK(cudaSetDevice(0));
-    CUDA_CHECK(cudaFree(0));
-
-    size_t freeMemory = 0;
-    size_t totalMemory = 0;
-
-    CUDA_CHECK(cudaMemGetInfo(&freeMemory, &totalMemory));
-
-    if (solver.size > freeMemory)
-    {
-        char message[512];
-        std::snprintf(
-            message,
-            sizeof(message),
-            "The CUDA device has %zu bytes free, but the explicit MGPCG workspace requires %zu bytes. cuDSS will also allocate internal memory.",
-            freeMemory,
-            solver.size);
-        throw std::runtime_error(message);
-    }
-
-    CUDA_CHECK(cudaMalloc(&solver.d_workspace,solver.size));
-
-    char* dW = static_cast<char*>(solver.d_workspace);
-    size_t offset = 0;
-
-    auto takeDouble = [&](size_t count) -> double*
-        {
-            const size_t bytes = checkedMultiply(count, sizeof(double));
-
-            if (offset > solver.size || bytes > solver.size - offset)
-            {
-                throw std::runtime_error("Double workspace layout exceeds the allocated buffer.");
-            }
-
-            double* pointer = reinterpret_cast<double*>(dW + offset);
-            offset += bytes;
-            return pointer;
-        };
-
-    auto takeInt32 = [&](size_t count) -> int32_t*
-        {
-            const size_t bytes = checkedMultiply(count, sizeof(int32_t));
-
-            if (offset > solver.size || bytes > solver.size - offset)
-            {
-                throw std::runtime_error("Integer workspace layout exceeds the allocated buffer.");
-            }
-
-            int32_t* pointer = reinterpret_cast<int32_t*>(dW + offset);
-            offset += bytes;
-            return pointer;
-        };
-
-    // All double arrays.
-    solver.levels[0].d_eleModulus = takeDouble(static_cast<size_t>(solver.levels[0].numElements));
-
-    for (int levelIndex = 0;levelIndex < solver.numLevels - 1;++levelIndex)
-    {
-        solver.levels[levelIndex].d_dK = takeDouble(static_cast<size_t>(solver.levels[levelIndex].numDOFs));
-    }
-
-    const size_t finestDOFs = static_cast<size_t>(solver.levels[0].numDOFs);
-
-    solver.d_y = takeDouble(finestDOFs);
-    solver.d_r = takeDouble(finestDOFs);
-    solver.d_p = takeDouble(finestDOFs);
-    solver.d_Ap = takeDouble(finestDOFs);
-
-    solver.d_coarseRhsFree = takeDouble(static_cast<size_t>(solver.numCoarseFreeDOFs));
-    solver.d_coarseXFree = takeDouble(static_cast<size_t>(solver.numCoarseFreeDOFs));
-    solver.d_coarseValues = takeDouble(static_cast<size_t>(solver.coarseNNZ));
-
-    // Finest MG workspace aliases existing PCG vectors.
-    solver.levels[0].d_rhs = solver.d_r;
-    solver.levels[0].d_x = solver.d_Ap;
-    solver.levels[0].d_rTilde = nullptr;
-
-    // Allocate separate MG rhs/x only for coarse levels.
-    for (int levelIndex = 1; levelIndex < solver.numLevels; ++levelIndex)
-    {
-        Level& level = solver.levels[levelIndex];
-
-        level.d_rhs = takeDouble(static_cast<size_t>(level.numDOFs));
-        level.d_x = takeDouble(static_cast<size_t>(level.numDOFs));
-        level.d_rTilde = nullptr;
-    }
-
-    // All integer arrays.
-    Level& finest = solver.levels[0];
-    finest.d_nodeToElements = takeInt32(static_cast<size_t>(finest.numNodes) * 8);
-    finest.d_eNodMat = takeInt32(static_cast<size_t>(finest.numElements) * 8);
-    for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
-    {
-        Level& level = solver.levels[levelIndex];
-
-        level.d_nodGridId = takeInt32(static_cast<size_t>(level.numNodes));
-        level.d_nodMapForward = takeInt32(level.numGridNodes);
-    }
-
-    solver.d_fixedDOFIds = takeInt32(static_cast<size_t>(solver.numFixedDOFs));
-    solver.d_coarseFreeDOFIds = takeInt32(static_cast<size_t>(solver.numCoarseFreeDOFs));
-    solver.d_coarseRowOffsets = takeInt32(static_cast<size_t>(solver.numCoarseFreeDOFs) + 1);
-    solver.d_coarseColIndices = takeInt32(static_cast<size_t>(solver.coarseNNZ));
-
-    if (offset != solver.size)
-    {
-        throw std::runtime_error("Internal GPU workspace byte count does not match the allocated size.");
-    }
-    CUDA_CHECK(
-        cudaMemcpy(finest.d_eNodMat, finest.h_eNodMat,
-            static_cast<size_t>(finest.numElements) * 8 * sizeof(int32_t),
-            cudaMemcpyHostToDevice));
-    CUDA_CHECK(
-        cudaMemcpy(finest.d_nodeToElements, finest.h_nodeToElements,
-            static_cast<size_t>(finest.numNodes) * 8 * sizeof(int32_t),
-            cudaMemcpyHostToDevice));
-    for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
-    {
-        Level& level = solver.levels[levelIndex];
-
-        CUDA_CHECK(
-            cudaMemcpy(level.d_nodGridId, level.h_nodGridId,
-                static_cast<size_t>(level.numNodes) * sizeof(int32_t),
-                cudaMemcpyHostToDevice));
-
-        CUDA_CHECK(
-            cudaMemcpy(level.d_nodMapForward, level.h_nodMapForward,
-                level.numGridNodes * sizeof(int32_t),
-                cudaMemcpyHostToDevice));
-
-        if (levelIndex == 0)
-        {
-            CUDA_CHECK(
-                cudaMemcpy(level.d_eleModulus, level.h_eleModulus,
-                    static_cast<size_t>(level.numElements) * sizeof(double),
-                    cudaMemcpyHostToDevice));
-        }
-
-        if (levelIndex < solver.numLevels - 1)
-        {
-            CUDA_CHECK(
-                cudaMemcpy(level.d_dK, level.h_dK,
-                    static_cast<size_t>(level.numDOFs) * sizeof(double),
-                    cudaMemcpyHostToDevice));
-        }
-
-        CUDA_CHECK(
-            cudaMemset(
-                level.d_rhs, 0,
-                static_cast<size_t>(level.numDOFs) * sizeof(double)));
-        CUDA_CHECK(
-            cudaMemset(level.d_x, 0,
-                static_cast<size_t>(level.numDOFs) * sizeof(double)));
-
-    }
-
-    if (solver.numFixedDOFs > 0)
-    {
-        CUDA_CHECK(
-            cudaMemcpy(solver.d_fixedDOFIds, solver.h_fixedDOFIds,
-                static_cast<size_t>(solver.numFixedDOFs) * sizeof(int32_t),
-                cudaMemcpyHostToDevice));
-    }
-
-    CUDA_CHECK(
-        cudaMemcpy(solver.d_coarseFreeDOFIds, solver.h_coarseFreeDOFIds,
-            static_cast<size_t>(solver.numCoarseFreeDOFs) * sizeof(int32_t),
-            cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(
-        cudaMemcpy(solver.d_coarseRowOffsets, solver.h_coarseRowOffsets.data(),
-            (static_cast<size_t>(solver.numCoarseFreeDOFs) + 1) * sizeof(int32_t),
-            cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(
-        cudaMemcpy(solver.d_coarseColIndices, solver.h_coarseColIndices.data(),
-            static_cast<size_t>(solver.coarseNNZ) * sizeof(int32_t),
-            cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(
-        cudaMemcpy(solver.d_coarseValues, solver.h_coarseValues,
-            static_cast<size_t>(solver.coarseNNZ) * sizeof(double),
-            cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(
-        cudaMemcpy(
-            solver.d_y,
-            solver.h_y,
-            finestDOFs * sizeof(double),
-            cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(cudaMemcpy(
-        solver.d_r,
-        solver.h_b,
-        finestDOFs * sizeof(double),
-        cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(
-        cudaMemset(
-            solver.d_p,
-            0,
-            finestDOFs * sizeof(double)));
-    CUDA_CHECK(
-        cudaMemset(
-            solver.d_Ap,
-            0,
-            finestDOFs * sizeof(double)));
-    CUDA_CHECK(
-        cudaMemset(
-            solver.d_coarseRhsFree,
-            0,
-            static_cast<size_t>(
-                solver.numCoarseFreeDOFs) *
-                sizeof(double)));
-    CUDA_CHECK(
-        cudaMemset(
-            solver.d_coarseXFree,
-            0,
-            static_cast<size_t>(
-                solver.numCoarseFreeDOFs) *
-                sizeof(double)));
-
-    CUDA_CHECK(
-        cudaMemcpyToSymbol(
-            c_Ke,
-            solver.h_Ke,
-            24 * 24 * sizeof(double)));
-
-    CUBLAS_CHECK(
-        cublasCreate(
-            &solver.cublasHandle));
-    CUBLAS_CHECK(
-        cublasSetPointerMode(
-            solver.cublasHandle,
-            CUBLAS_POINTER_MODE_HOST));
-
-    initializeCoarseSolver(solver);
-
-    solver.initialized = true;
-
-    MEX_PRINT(
-        "MGPCG explicit GPU workspace: %.3f GiB (device free before cuDSS internals: %.3f GiB)",
-        static_cast<double>(solver.size) /
-            (1024.0 * 1024.0 * 1024.0),
-        static_cast<double>(freeMemory) /
-            (1024.0 * 1024.0 * 1024.0));
-}
-
-static void initializeCoarseSolver(
-    SingleGPUData& solver)
-{
-    const int64_t n =
-        static_cast<int64_t>(
-            solver.numCoarseFreeDOFs);
-
-    CUDSS_CHECK(
-        cudssCreate(
-            &solver.cudssHandle));
-    CUDSS_CHECK(
-        cudssSetStream(
-            solver.cudssHandle,
-            static_cast<cudaStream_t>(0)));
-    CUDSS_CHECK(
-        cudssConfigCreate(
-            &solver.cudssConfig));
-    CUDSS_CHECK(
-        cudssDataCreate(
-            solver.cudssHandle,
-            &solver.cudssData));
-
-    CUDSS_CHECK(
-        cudssMatrixCreateCsr(
-            &solver.cudssA,
-            n,
-            n,
-            solver.coarseNNZ,
-            solver.d_coarseRowOffsets,
-            nullptr,
-            solver.d_coarseColIndices,
-            solver.d_coarseValues,
-            CUDSS_R_32I,
-            CUDSS_R_32I,
-            CUDSS_R_64F,
-            CUDSS_MTYPE_SPD,
-            CUDSS_MVIEW_LOWER,
-            CUDSS_BASE_ZERO));
-
-    CUDSS_CHECK(
-        cudssMatrixCreateDn(
-            &solver.cudssB,
-            n,
-            1,
-            n,
-            solver.d_coarseRhsFree,
-            CUDSS_R_64F,
-            CUDSS_LAYOUT_COL_MAJOR));
-
-    CUDSS_CHECK(
-        cudssMatrixCreateDn(
-            &solver.cudssX,
-            n,
-            1,
-            n,
-            solver.d_coarseXFree,
-            CUDSS_R_64F,
-            CUDSS_LAYOUT_COL_MAJOR));
-
-    CUDSS_CHECK(
-        cudssExecute(
-            solver.cudssHandle,
-            CUDSS_PHASE_ANALYSIS,
-            solver.cudssConfig,
-            solver.cudssData,
-            solver.cudssA,
-            solver.cudssX,
-            solver.cudssB));
-
-    CUDSS_CHECK(
-        cudssExecute(
-            solver.cudssHandle,
-            CUDSS_PHASE_FACTORIZATION,
-            solver.cudssConfig,
-            solver.cudssData,
-            solver.cudssA,
-            solver.cudssX,
-            solver.cudssB));
-
-    // Factorization can be asynchronous. Synchronize before reading INFO.
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    int info = 0;
-    size_t sizeWritten = 0;
-
-    CUDSS_CHECK(
-        cudssDataGet(
-            solver.cudssHandle,
-            solver.cudssData,
-            CUDSS_DATA_INFO,
-            &info,
-            sizeof(info),
-            &sizeWritten));
-
-    if (sizeWritten != sizeof(info))
-    {
-        throw std::runtime_error(
-            "cuDSS returned an unexpected CUDSS_DATA_INFO size.");
-    }
-
-    if (info != 0)
-    {
-        char message[512];
-        std::snprintf(
-            message,
-            sizeof(message),
-            "cuDSS coarse Cholesky factorization failed at reordered 1-based minor %d.",
-            info);
-        throw std::runtime_error(message);
-    }
 }
 
 static void zeroFixedDOFs(
@@ -1818,15 +1129,18 @@ static double globalDotProduct(
     // Step 1: Compute local dot product with cuBLAS.
     double localDot = 0.0;
 
-    CUBLAS_CHECK(
-        cublasDdot(
-            solver.cublasHandle,
-            n,
-            d_a,
-            1,
-            d_b,
-            1,
-            &localDot));
+    const int offset = 3 * solver.levels[0].numLeftSharedNodes;
+
+    const int ownedDOFs = solver.levels[0].numDOFs - offset;
+
+    cublasDdot(
+        handle,
+        ownedDOFs,
+        d_a + offset,
+        1,
+        d_b + offset,
+        1,
+        &localDot);
 
     // Step 2: Allocate device scalar for NCCL.
     double* d_dot = nullptr;
@@ -1872,26 +1186,34 @@ static void globalNorm(
     double& residualNorm,
     singleGPUData& solver,
     ncclComm_t comm,
-    ncclStream_t ncclStream,
+    cudaStream_t ncclStream,
     const double* d_r)
 {
-    const int n = solver.levels[0].numDOFs;
+    const Level& fine = solver.levels[0];
 
-    // Step 1: Compute local L2 norm.
+    // Skip the left interface, which is owned by the previous GPU.
+    const int offset = 3 * fine.numLeftSharedNodes;
+
+    const int ownedDOFs = fine.numDOFs - offset;
+
+    const double* d_ownedR = d_r + offset;
+
     double localNorm = 0.0;
 
-    CUBLAS_CHECK(
-        cublasDnrm2(
-            solver.cublasHandle,
-            n,
-            d_r,
-            1,
-            &localNorm));
+    CUBLAS_CHECK(cublasDnrm2(
+        handle,
+        ownedDOFs,
+        d_ownedR,
+        1,
+        &localNorm
+    ));
 
-    // Step 2: Square the local norm.
+    const double localSquaredNorm = localNorm * localNorm;
+
+    // Square the local norm.
     double localSquaredNorm = localNorm * localNorm;
 
-    // Step 3: Allocate device scalar for NCCL.
+    // Allocate device scalar for NCCL.
     double* d_norm = nullptr;
     CUDA_CHECK(cudaMalloc(&d_norm, sizeof(double)));
 
@@ -1904,7 +1226,7 @@ static void globalNorm(
         cudaMemcpyHostToDevice,
         ncclStream));
 
-    // Step 4: Sum squared norms across all GPUs.
+    // Sum squared norms across all GPUs.
     NCCL_CHECK(
         ncclAllReduce(
             d_norm,
@@ -1915,7 +1237,7 @@ static void globalNorm(
             comm,
             ncclStream));
 
-    // Step 5: Copy global squared norm to host.
+    // Copy global squared norm to host.
     double globalSquaredNorm = 0.0;
 
     CUDA_CHECK(cudaMemcpyAsync(
@@ -1925,14 +1247,15 @@ static void globalNorm(
         cudaMemcpyDeviceToHost,
         ncclStream));
 
+    CUDA_CHECK(cudaStreamSynchronize(ncclStream));
+
     CUDA_CHECK(cudaFree(d_norm));
 
-    // Step 6: Compute global L2 norm.
     residualNorm = std::sqrt(globalSquaredNorm);
 }
 
 static void solveCoarsest(
-    SingleGPUData& solver,
+    singleGPUData& solver,
     const double* d_rhs,
     double* d_x)
 {
@@ -2412,11 +1735,13 @@ static void applyVcycle(
             const int neighbor = coarse.right.neighborGPU;
 
             sendOneSideHalo(
-                G,
+                G.deviceId,,
                 coarse.right,
                 coarse.d_rhs,
-                streams.rightStream
+                neighbor,
                 gpuData[neighbor].levels[fineIndex + 1].d_rhs,
+                streams.rightStream
+
             );
         }
 
@@ -2426,11 +1751,12 @@ static void applyVcycle(
             const int neighbor = coarse.left.neighborGPU;
 
             sendOneSideHalo(
-                G,
+                G.deviceId,
                 coarse.left,
                 coarse.d_rhs,
-                streams.leftStream,
+                neighbor,
                 gpuData[neighbor].levels[fineIndex + 1].d_rhs,
+                streams.leftStream
             );
         }
 
@@ -2472,8 +1798,8 @@ static void applyVcycle(
     // Ensure the broadcast is complete before interpolation.
     broadcastCoarseSolution(
         G,
-        gpuData,
-        lastLevel
+        G.coarsestLevel,
+        ncclComms
     );
 
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -2711,6 +2037,35 @@ static void applyFinestOperator(
     const int numGPUs = G.numGPUs;
     const int deviceId = G.deviceId;
 
+    // Exchange finest-level interface contributions with neighboring GPUs.
+    // Send to the right neighbor.
+    if (finest.rightInterface.neighborGPU >= 0)
+    {
+        const int neighbor = finest.rightInterface.neighborGPU;
+
+        sendOneSideInterface(
+            G,
+            finest.rightInterface,
+            d_Ax,
+            streams.rightStream,
+            gpuData[neighbor].levels[0] .leftInterface.d_recvBuffer
+        );
+    }
+
+    // Send to the left neighbor.
+    if (finest.leftInterface.neighborGPU >= 0)
+    {
+        const int neighbor = finest.leftInterface.neighborGPU;
+
+        sendOneSideInterface(
+            G,
+            finest.leftInterface,
+            d_Ax,
+            streams.leftStream,
+            gpuData[neighbor].levels[0].rightInterface.d_recvBuffer
+        );
+    }
+
     constexpr int blockSize = 256;
 
     Level& finest = G.levels[0];
@@ -2940,7 +2295,7 @@ static void runMGPCG(
         zeroFixedDOFs(solver, solver.d_r);
         zeroFixedDOFs(solver, solver.d_y);
 
-        nnclComm_t* comm = &comms[g];
+        ncclComm_t* comm = &comms[g];
         StreamData& streams = solver.streams;
     
         // Ensure constraints are applied before reductions.
@@ -3047,7 +2402,7 @@ static void runMGPCG(
             // Global rho = z'*r
             rho = globalDotProduct(
                 solver,
-                comms[g],
+                streams.ncclStream,
                 solver.d_Ap,
                 solver.d_r
             );
@@ -3079,7 +2434,7 @@ static void runMGPCG(
             // Global pAp = p'*A*p
             double pAp = globalDotProduct(
                 solver,
-                comms[g],
+                streams.ncclStream,
                 solver.d_p,
                 solver.d_Ap
             );
@@ -3140,7 +2495,7 @@ static void runMGPCG(
             globalNorm(
                 residualNorm,
                 solver,
-                comms[g],
+                streams.ncclStream,
                 solver.d_r
             );
 
@@ -3182,7 +2537,7 @@ static void runMGPCG(
 
             double rhoNew = globalDotProduct(
                 solver,
-                comms[g],
+                streams.ncclStream,
                 solver.d_Ap,
                 solver.d_r
             );
@@ -3347,15 +2702,9 @@ void mexFunction(
         SolverContext solver;
         try
         {
-            initializeGPUHierarchy(
-                solver,
-                prhs[4],
-                prhs[0],
-                prhs[3],
-                tolerance,
-                maxIterations);
+            initializeGPUHierarchy();
 
-            initializeGPU(solver);
+            initializeGPUs();
 
             runMGPCG(solver);
 

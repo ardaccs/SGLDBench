@@ -61,11 +61,23 @@ static double globalDotProduct(singleGPUData& solver, ncclComm_t comm,
         ncclDouble,
         ncclSum,
         comm,
-        ncclStream));
+        ncclStream
+    ));
 
     CUDA_OK(cudaStreamSynchronize(ncclStream));
-    CUDA_OK(cudaMemcpy(&globalDot,d_dot,sizeof(double),cudaMemcpyDeviceToHost));
+
+    // Retrieve global result.
+    double globalDot = 0.0;
+
+    CUDA_OK(cudaMemcpy(
+        &globalDot,
+        d_dot,
+        sizeof(double),
+        cudaMemcpyDeviceToHost
+    ));
+
     CUDA_OK(cudaFree(d_dot));
+
     return globalDot;
 }
 

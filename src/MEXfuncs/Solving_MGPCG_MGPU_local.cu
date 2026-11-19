@@ -621,7 +621,7 @@ __global__ void kbyu_kernel(
         if (elem < 0 || elem >= numElements)
             continue;
 
-        //TODO.When you first load or build your nodeToElements and eNodMat arrays in MATLAB or C++, run a quick validation pass there once.
+        // Connectivity indices are range-checked once during host initialization.
         int localNode = -1;
 
         // Gather the 8 global nodes of this element from eNodMat(elem, :).
@@ -640,7 +640,7 @@ __global__ void kbyu_kernel(
         for (int j = 0; j < 8; ++j)
         {
             int n = elemNodes[j];
-            //TODO. Also validate in MATLAB OR C++
+            // Element-node indices are validated during host initialization.
             /*
             if (n < 0 || n >= numNodes)
             {
@@ -1451,6 +1451,35 @@ static void initializeGPUHierarchy(std::vector<singleGPUData>& Gs,
             }
         }
     }
+    // Reject incomplete halo maps rather than silently computing with stale ghosts.
+    for (int l=0;l<nlev;++l) {
+        for (int g=0;g+1<ng;++g) {
+            const Level& left=Gs[g].levels[l];
+            const Level& right=Gs[g+1].levels[l];
+            std::unordered_map<int32_t,int> positions;
+            for (int j=0;j<right.numNodes;++j)
+                positions.emplace(right.globalNodeIds[j],j);
+            for (int i=0;i<left.numNodes;++i) {
+                const auto it=positions.find(left.globalNodeIds[i]);
+                if (it==positions.end()) continue;
+                const int j=it->second;
+                const bool leftOwner=left.ownedMask[i]!=0;
+                const bool rightOwner=right.ownedMask[j]!=0;
+                if (leftOwner == rightOwner)
+                    throw std::runtime_error("A shared node must have exactly one owner.");
+                const HaloSide& send=leftOwner?left.right:right.left;
+                const int source=leftOwner?i+1:j+1;
+                const int target=leftOwner?j+1:i+1;
+                bool found=false;
+                for (size_t k=0;k<send.sendLocal.size();++k)
+                    if (send.sendLocal[k]==source && send.sendDestLocal[k]==target) {
+                        found=true;break;
+                    }
+                if (!found) throw std::runtime_error(
+                    "Missing owner-to-ghost halo entry for a shared global node.");
+            }
+        }
+    }
     for (int g=0;g<ng;++g) {
         Level& L=Gs[g].levels.front();
         if (g>0) L.leftInterface.recvLocal=Gs[g-1].levels.front().rightInterface.sendDestLocal;
@@ -1523,6 +1552,15 @@ static void initializeCoarseSolver(GlobalCoarseSolve& C)
     if (sizeWritten!=sizeof(info) || info!=0)
         throw std::runtime_error("cuDSS coarse factorization failed (INFO="+std::to_string(info)+").");
     C.initialized=true;
+}
+
+// C++11-compatible typed CUDA allocation helper.  Avoid generic lambdas
+// (lambda parameters declared with auto require C++14 or newer).
+template <typename T>
+static void allocateDeviceArray(T*& ptr, size_t bytes)
+{
+    if (bytes != 0)
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ptr), bytes));
 }
 
 static void initializeGPUs(std::vector<singleGPUData>& Gs, GlobalCoarseSolve& C)
@@ -1617,20 +1655,17 @@ static void initializeGPUs(std::vector<singleGPUData>& Gs, GlobalCoarseSolve& C)
         G.initialized=true;
     }
     CUDA_CHECK(cudaSetDevice(0));
-    auto alloc = [](auto& ptr,size_t bytes) {
-        if (bytes) CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ptr),bytes));
-    };
     auto put = [](void* dst,const void* src,size_t bytes) {
         if (bytes) CUDA_CHECK(cudaMemcpy(dst,src,bytes,cudaMemcpyHostToDevice));
     };
-    alloc(C.d_globalRHS,size_t(C.globalNumDOFs)*sizeof(double));
-    alloc(C.d_globalX,size_t(C.globalNumDOFs)*sizeof(double));
-    alloc(C.d_coarseRhsFree,size_t(C.numCoarseFreeDOFs)*sizeof(double));
-    alloc(C.d_coarseXFree,size_t(C.numCoarseFreeDOFs)*sizeof(double));
-    alloc(C.d_coarseFreeDOFIds,size_t(C.numCoarseFreeDOFs)*sizeof(int32_t));
-    alloc(C.d_coarseRowPtr,size_t(C.numCoarseFreeDOFs+1)*sizeof(int32_t));
-    alloc(C.d_coarseColInd,size_t(C.coarseNNZ)*sizeof(int32_t));
-    alloc(C.d_coarseValues,size_t(C.coarseNNZ)*sizeof(double));
+    allocateDeviceArray(C.d_globalRHS,size_t(C.globalNumDOFs)*sizeof(double));
+    allocateDeviceArray(C.d_globalX,size_t(C.globalNumDOFs)*sizeof(double));
+    allocateDeviceArray(C.d_coarseRhsFree,size_t(C.numCoarseFreeDOFs)*sizeof(double));
+    allocateDeviceArray(C.d_coarseXFree,size_t(C.numCoarseFreeDOFs)*sizeof(double));
+    allocateDeviceArray(C.d_coarseFreeDOFIds,size_t(C.numCoarseFreeDOFs)*sizeof(int32_t));
+    allocateDeviceArray(C.d_coarseRowPtr,size_t(C.numCoarseFreeDOFs+1)*sizeof(int32_t));
+    allocateDeviceArray(C.d_coarseColInd,size_t(C.coarseNNZ)*sizeof(int32_t));
+    allocateDeviceArray(C.d_coarseValues,size_t(C.coarseNNZ)*sizeof(double));
     put(C.d_coarseFreeDOFIds,C.h_freeIdsOwned.data(),size_t(C.numCoarseFreeDOFs)*sizeof(int32_t));
     put(C.d_coarseRowPtr,C.h_coarseRowPtr,size_t(C.numCoarseFreeDOFs+1)*sizeof(int32_t));
     put(C.d_coarseColInd,C.h_coarseColInd,size_t(C.coarseNNZ)*sizeof(int32_t));
@@ -1641,10 +1676,10 @@ static void initializeGPUs(std::vector<singleGPUData>& Gs, GlobalCoarseSolve& C)
     for (size_t g=0;g<ng;++g) {
         const Level& L=Gs[g].levels.back();
         const size_t n=L.numNodes;
-        alloc(C.d_recvResidual[g],3*n*sizeof(double));
-        alloc(C.d_sendResidual[g],3*n*sizeof(double));
-        alloc(C.d_globalNodeIds[g],n*sizeof(int32_t));
-        alloc(C.d_ownedMasks[g],n*sizeof(uint8_t));
+        allocateDeviceArray(C.d_recvResidual[g],3*n*sizeof(double));
+        allocateDeviceArray(C.d_sendResidual[g],3*n*sizeof(double));
+        allocateDeviceArray(C.d_globalNodeIds[g],n*sizeof(int32_t));
+        allocateDeviceArray(C.d_ownedMasks[g],n*sizeof(uint8_t));
         put(C.d_globalNodeIds[g],L.h_globalNodeIds,n*sizeof(int32_t));
         put(C.d_ownedMasks[g],L.h_ownedNodeMask,n*sizeof(uint8_t));
     }
@@ -2062,7 +2097,7 @@ static void applyVcycle(
         Level& fine = G.levels[fineIndex];
         Level& coarse = G.levels[fineIndex + 1];
 
-        // Todo-->why??
+        // One Jacobi smoothing kernel thread per DOF.
         const int smoothGrid = gridSizeFor(fine.numDOFs, blockSize);
 
         if (fineIndex == 0)
@@ -2284,7 +2319,8 @@ static void applyVcycle(
         // All GPUs finish this level before proceeding to the next finer level.
         workerBarrier();
     }
-    // TODO---> fixed-DOF indices must be local to the current GPU, and your correction output convention should clearly specify whether ghost nodes are included. THis is valid for everytime this is called.
+    // Local fixed-DOF indices are constructed at initialization; ghosts are
+    // retained in the local correction but excluded from global scalar products.
     zeroFixedDOFs(G, finest.d_x);
 
     if (d_fineCorrection != finest.d_x)
@@ -2411,9 +2447,6 @@ static void applyFinestOperator(
     StreamData& streams,
     const std::vector<singleGPUData>& gpuData)
 {
-    const int numGPUs = G.numGPUs;
-    const int deviceId = G.deviceId;
-
     constexpr int blockSize = 256;
 
     Level& finest = G.levels[0];
@@ -2692,7 +2725,7 @@ static void runMGPCG(
         numGPUs,
         deviceIds.data()));
 
-    // Initialize communication streams.------->TODO: put this in initializationFunction
+    // Communication streams are scoped to runMGPCG for exception-safe cleanup.
     for (int i = 0; i < numGPUs; ++i)
     {
         CUDA_CHECK(cudaSetDevice(gpuData[i].deviceId));

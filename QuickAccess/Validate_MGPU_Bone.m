@@ -86,7 +86,7 @@ for testIndex = 1:numTests
 
     tStart = tic;
 
-    IO_LoadBuiltInDatasets('Bone', resolution);
+    IO_LoadBuiltInDatasets('Bone', resolution, numGPUs);
 
     voxelTime = toc(tStart);
 
@@ -99,7 +99,7 @@ for testIndex = 1:numTests
     tStart = tic;
 
     FEA_ApplyBoundaryCondition();
-    FEA_SetupVoxelBased();
+    FEA_SetupVoxelBased(numGPUs);
 
     densityField = ones( ...
         meshHierarchy_(1).numElements, ...

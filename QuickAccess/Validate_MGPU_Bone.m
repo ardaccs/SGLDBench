@@ -161,16 +161,14 @@ for testIndex = 1:numTests
     hierarchyTimer = tic;
     fprintf('\n--- Checking multigrid span widths ---\n');
 
-    for k = 1:numel(meshHierarchy_)
-        fprintf('Level %d:\n', k);
-
-        if isfield(meshHierarchy_(k), 'spanWidth')
-            disp(meshHierarchy_(k).spanWidth);
-        else
-            fprintf('spanWidth field missing\n');
-        end
+    % Convert destination-level spanWidth to source-level convention.
+    for level = 1:numel(meshHierarchy_)-1
+        meshHierarchy_(level).spanWidth = ...
+            meshHierarchy_(level+1).spanWidth;
     end
-    H_ = Build_GPU_Hierarchy_MGPU_2(meshHierarchy_, numGPUs, solverDataThisTest);
+
+    H_ = Build_GPU_Hierarchy_MGPU_2( ...
+        meshHierarchy_, numGPUs, solverDataThisTest);
     hierarchyTime = toc(hierarchyTimer);
 
     % MATLAB sparse vectors can still be class 'double'. MEX code uses

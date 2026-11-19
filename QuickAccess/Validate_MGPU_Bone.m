@@ -166,7 +166,15 @@ for testIndex = 1:numTests
         meshHierarchy_(level).spanWidth = ...
             meshHierarchy_(level+1).spanWidth;
     end
-
+    if isfield(meshHierarchy_(1), 'weightFactorJacobi')
+        solverDataThisTest.jacobiOmega = ...
+            meshHierarchy_(1).weightFactorJacobi;
+    elseif isfield(meshHierarchy_(1), 'jacobiOmega')
+        solverDataThisTest.jacobiOmega = ...
+            meshHierarchy_(1).jacobiOmega;
+    else
+        error('Jacobi damping factor not found in mesh hierarchy.');
+    end
     H_ = Build_GPU_Hierarchy_MGPU_2( ...
         meshHierarchy_, numGPUs, solverDataThisTest);
     hierarchyTime = toc(hierarchyTimer);

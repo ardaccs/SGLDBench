@@ -15,7 +15,21 @@
 #include <stdexcept>
 #include <limits>
 #include <omp.h>
+#include <atomic>
+#include <exception>
+#include <mutex>
+#include <thread>
+#include <utility>
+#include <algorithm>
+#include <unordered_set>
+#include <unordered_map>
+/*
+Notes on implementation:
+    - One additional issue: throwing a C++ exception from one OpenMP thread while other threads are waiting at a barrier is unsafe. Eventually, CUDA/NCCL errors should be handled through a shared failure mechanism or by aborting the collective operation consistently.
+    - Check Cuda device setting
+    - every gpu can have a cublas handle, but only one cudss handle is needed for the coarsest level solve. The cudss handle is created on GPU 0 and used for the coarsest level solve on all GPUs.
 
+*/
 // Elementary stiffness matrix (24 x 24 doubles = 4608 bytes).
 __constant__ double c_Ke[24 * 24];
 
@@ -101,20 +115,163 @@ static std::runtime_error makeCudssError(
         mexEvalString("drawnow;");                                           \
     } while (0)
 
-#define NCCL_CHECK(cmd) do {                         \
-    ncclResult_t res = cmd;                           \
-    if (res != ncclSuccess) {                         \
-        printf("NCCL error %s:%d '%s'\n",             \
-            __FILE__, __LINE__, ncclGetErrorString(res)); \
-        exit(EXIT_FAILURE);                           \
-    }                                                 \
-} while(0)
+// NCCL errors are C++ errors; never terminate the MATLAB host with exit().
+static std::runtime_error makeNcclError(
+    ncclResult_t status, const char* expression, const char* file, int line)
+{
+    char message[1024];
+    std::snprintf(message, sizeof(message),
+        "NCCL call failed at %s:%d: %s -> %s (status %d)",
+        file, line, expression, ncclGetErrorString(status), static_cast<int>(status));
+    return std::runtime_error(message);
+}
+
+#define NCCL_CHECK(call)                                                     \
+    do {                                                                     \
+        const ncclResult_t status__ = (call);                                 \
+        if (status__ != ncclSuccess)                                          \
+            throw makeNcclError(status__, #call, __FILE__, __LINE__);          \
+    } while (0)
+
+// Aborting a failed worker must also release peers waiting at a CPU barrier.
+// This replaces ONLY synchronization's error path; no new CUDA syncs are added.
+class FailureAwareBarrier
+{
+    const int participants_;
+    std::atomic<int> arrivals_{0};
+    std::atomic<unsigned> generation_{0};
+    std::atomic<bool> failed_{false};
+    mutable std::mutex errorMutex_;
+    std::exception_ptr firstError_;
+
+public:
+    explicit FailureAwareBarrier(int participants) : participants_(participants) {}
+
+    void fail(std::exception_ptr error) noexcept
+    {
+        try {
+            std::lock_guard<std::mutex> lock(errorMutex_);
+            if (!firstError_)
+                firstError_ = error;
+        } catch (...) { /* reporting must never throw */ }
+        failed_.store(true, std::memory_order_release);
+    }
+
+    void wait()
+    {
+        if (failed_.load(std::memory_order_acquire))
+            throw std::runtime_error("Multi-GPU worker failed before synchronization.");
+
+        const unsigned expected = generation_.load(std::memory_order_acquire);
+        if (arrivals_.fetch_add(1, std::memory_order_acq_rel) == participants_ - 1)
+        {
+            arrivals_.store(0, std::memory_order_relaxed);
+            generation_.fetch_add(1, std::memory_order_release);
+        }
+        else
+        {
+            unsigned spins = 0;
+            while (generation_.load(std::memory_order_acquire) == expected)
+            {
+                if (failed_.load(std::memory_order_acquire))
+                    throw std::runtime_error("Multi-GPU worker failed during synchronization.");
+                if ((++spins & 255u) == 0)
+                    std::this_thread::yield();
+            }
+        }
+        if (failed_.load(std::memory_order_acquire))
+            throw std::runtime_error("Multi-GPU worker failed during synchronization.");
+    }
+
+    std::exception_ptr error() const
+    {
+        std::lock_guard<std::mutex> lock(errorMutex_);
+        return firstError_;
+    }
+};
+
+static thread_local FailureAwareBarrier* currentWorkerBarrier = nullptr;
+
+static void workerBarrier()
+{
+    if (!currentWorkerBarrier)
+        throw std::runtime_error("Multi-GPU synchronization used outside a worker.");
+    currentWorkerBarrier->wait();
+}
+
+struct ScopedWorkerBarrier
+{
+    explicit ScopedWorkerBarrier(FailureAwareBarrier& barrier) noexcept
+    {
+        currentWorkerBarrier = &barrier;
+    }
+    ~ScopedWorkerBarrier() noexcept { currentWorkerBarrier = nullptr; }
+    ScopedWorkerBarrier(const ScopedWorkerBarrier&) = delete;
+    ScopedWorkerBarrier& operator=(const ScopedWorkerBarrier&) = delete;
+};
+
+// A temporary device scalar has exactly the same allocation lifetime on success,
+// but is also freed if a CUDA/NCCL check throws.
+class ScopedDeviceScalar
+{
+    double* ptr_ = nullptr;
+public:
+    ScopedDeviceScalar()
+    {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ptr_), sizeof(double)));
+    }
+    ~ScopedDeviceScalar() noexcept
+    {
+        if (ptr_) (void)cudaFree(ptr_);
+    }
+    void releaseChecked()
+    {
+        if (!ptr_) return;
+        double* temporary = ptr_;
+        ptr_ = nullptr;
+        CUDA_CHECK(cudaFree(temporary));
+    }
+    double* get() const noexcept { return ptr_; }
+    ScopedDeviceScalar(const ScopedDeviceScalar&) = delete;
+    ScopedDeviceScalar& operator=(const ScopedDeviceScalar&) = delete;
+};
+
+class ScopedNcclGroup
+{
+    bool started_ = false;
+public:
+    ScopedNcclGroup() { NCCL_CHECK(ncclGroupStart()); started_ = true; }
+    void finish()
+    {
+        if (!started_) return;
+        started_ = false;
+        NCCL_CHECK(ncclGroupEnd());
+    }
+    ~ScopedNcclGroup() noexcept
+    {
+        // If an operation threw while the group was open, the outer worker
+        // failure handler aborts the communicator. Do not risk blocking in
+        // ncclGroupEnd() during stack unwinding.
+    }
+    ScopedNcclGroup(const ScopedNcclGroup&) = delete;
+    ScopedNcclGroup& operator=(const ScopedNcclGroup&) = delete;
+};
+
+struct ScopedNvtxRange
+{
+    explicit ScopedNvtxRange(const char* name) { nvtxRangePushA(name); }
+    ~ScopedNvtxRange() noexcept { nvtxRangePop(); }
+    ScopedNvtxRange(const ScopedNvtxRange&) = delete;
+    ScopedNvtxRange& operator=(const ScopedNvtxRange&) = delete;
+};
 
 // C++ level 0 corresponds to MATLAB meshHierarchy_(1).
 struct StreamData
 {
     cudaStream_t rightStream = nullptr;
     cudaStream_t leftStream = nullptr;
+    cudaStream_t computeStream = nullptr;
+    cudaStream_t ncclStream = nullptr;
 };
 
 struct HaloSide
@@ -138,9 +295,56 @@ struct InterfaceSide
 
     // Incoming message on this side
     int recvCount = 0;
+    std::vector<int32_t> recvLocal;
     int32_t* d_recvLocal = nullptr; //the receiving GPU's device copy of the incoming sender's sendDestLocal, in the same order as the message.
     // example--->GPU0.rightInterface.sendDestLocal --> GPU 1.leftInterface.d_recvLocal.
     double* d_recvBuffer = nullptr;
+};
+
+struct coarsestLevelData
+{
+    int numCoarseFreeDOFs = 0;
+    int coarseNNZ = 0;
+
+    const int32_t* h_coarseRowPtr = nullptr;
+    const int32_t* h_coarseColInd = nullptr;
+    const double* h_coarseValues = nullptr;
+
+    int32_t* d_coarseRowPtr = nullptr;
+    int32_t* d_coarseColInd = nullptr;
+    double* d_coarseValues = nullptr;
+
+    double* d_coarseRHS = nullptr;
+    double* d_coarseX = nullptr;
+
+    cudssHandle_t cudssHandle = nullptr;
+    cudssConfig_t cudssConfig = nullptr;
+    cudssData_t cudssData = nullptr;
+    cudssMatrix_t cudssA = nullptr;
+    cudssMatrix_t cudssB = nullptr;
+    cudssMatrix_t cudssX = nullptr;
+
+    // All allocated on GPU 0.
+    std::vector<double*> d_recvResidual;
+    std::vector<double*> d_sendResidual;
+    std::vector<int32_t*> d_globalNodeIds;
+    std::vector<int32_t*> d_localNodeIds;
+
+    // Number of normal local coarse nodes per GPU.
+    std::vector<int> localNodeCounts;
+
+    // Full global coarse vectors on GPU 0.
+    double* d_globalRHS = nullptr;
+    double* d_globalX = nullptr;
+
+    double* d_coarseRhsFree = nullptr;
+    double* d_coarseXFree = nullptr;
+    int32_t* d_coarseFreeDOFIds = nullptr;
+    std::vector<int32_t> h_rowOffsetsOwned, h_colIndicesOwned, h_freeIdsOwned;
+    std::vector<uint8_t*> d_ownedMasks;
+    std::vector<double> h_coarseValuesOwned;
+    bool initialized = false;
+    int globalNumDOFs = 0;
 };
 
 // C++ level 0 corresponds to MATLAB meshHierarchy_(1).
@@ -153,6 +357,7 @@ struct Level
     int numElements = 0;
     int numDOFs = 0;
     size_t numGridNodes = 0;
+    int numLeftSharedNodes = 0;
 
     // MATLAB-owned host data; pointers are valid during this MEX call.
     const int32_t* h_nodeToElements = nullptr;
@@ -162,6 +367,10 @@ struct Level
     const int32_t* h_sharedNodesLocal = nullptr;
     const double* h_eleModulus = nullptr;
     const double* h_dK = nullptr;
+    const uint8_t* h_ownedNodeMask = nullptr;
+    std::vector<uint8_t> ownedMask;
+    bool explicitOwnership = false;
+    std::vector<int32_t> globalNodeIds;
 
     // Device hierarchy data. This operation only needs the geometry maps.
     int32_t* d_nodeToElements = nullptr;
@@ -171,6 +380,7 @@ struct Level
     int32_t* d_sharedNodesLocal = nullptr;
     double* d_eleModulus = nullptr;
     double* d_dK = nullptr;
+    uint8_t* d_ownedNodeMask = nullptr;
 
     // Partition information and per-call vectors.
     const int32_t* h_globalNodeIds = nullptr;
@@ -203,31 +413,19 @@ struct singleGPUData
 
     std::vector<Level> levels;     // levels[0] = fine, levels[1] = coarse
     std::vector<int> spanWidths;
+    StreamData streams; // per-level streams for communication and computation
 
     // Kept from the existing data layout for compatibility with later stages.
-    const int32_t* h_nodeToElements = nullptr;
-    const int32_t* h_eNodMat = nullptr;
-    const int32_t* h_sharedNodesLocal = nullptr;
-    const int32_t* h_coarseNodeGridId = nullptr;
-    const int32_t* h_fineNodeMapForward = nullptr;
-    const double* h_eleModulus = nullptr;
-    const double* h_fineResidual = nullptr;
     const double* h_Ke = nullptr;
     const double* h_b = nullptr;
     const double* h_y = nullptr;
+    const double* h_r = nullptr;
+
     double* d_y = nullptr;
     double* d_r = nullptr;
     double* d_p = nullptr;
     double* d_Ap = nullptr;
 
-
-    int32_t* d_nodeToElements = nullptr;
-    int32_t* d_eNodMat = nullptr;
-    int32_t* d_sharedNodesLocal = nullptr;
-    int32_t* d_coarseNodeGridId = nullptr;
-    int32_t* d_fineNodeMapForward = nullptr;
-    double* d_eleModulus = nullptr;
-    double* d_fineResidual = nullptr;
 
     // CUDA events for timing.
     cudaEvent_t startEvent;
@@ -235,28 +433,66 @@ struct singleGPUData
     float totalVcycleTimeMs = 0.0f;
     float totalSpMVTimeMs = 0.0f;
 
+    // Data for coarsest level solve using cuDSS. 
+    int iterations = 0;
+    double relativeResidual = 0.0;
+    bool converged = false;
+    cublasHandle_t cublasHandle = nullptr;
+    int numFixedDOFs = 0;
+    const int32_t* h_fixedDOFIds = nullptr;
+    std::vector<int32_t> fixedDOFIds;
+    int32_t* d_fixedDOFIds = nullptr;
+    void* d_workspace = nullptr;
+    double* d_dotPartials = nullptr;
+    double* d_dotScalar = nullptr;
+    int partialCount = 0;
+    std::vector<double> localB, localY;
+    coarsestLevelData coarsestLevel;
 };
+// Global coarse resources exist only on GPU 0; VcycleShared is retained for
+// compatibility with the existing multi-GPU solver call graph.
+using GlobalCoarseSolve = coarsestLevelData;
+struct VcycleShared {};
 
-struct coarsestLevelData
+__global__ void ownedDotPartialKernel(
+    const double* __restrict__ a,
+    const double* __restrict__ b,
+    const uint8_t* __restrict__ ownedMask,
+    double* __restrict__ partial,
+    int numNodes)
 {
-    int numCoarseFreeDOFs = 0;
-    int coarseNNZ = 0;
+    extern __shared__ double sums[];
 
-    const int32_t* h_coarseRowPtr = nullptr;
-    const int32_t* h_coarseColInd = nullptr;
-    const double* h_coarseValues = nullptr;
+    const int tid = threadIdx.x;
+    const int index = blockIdx.x * blockDim.x + tid;
 
-    int32_t* d_coarseRowPtr = nullptr;
-    int32_t* d_coarseColInd = nullptr;
-    double* d_coarseValues = nullptr;
+    double sum = 0.0;
 
-    double* d_coarseRHS = nullptr;
-    double* d_coarseX = nullptr;
+    if (index < numNodes && ownedMask[index])
+    {
+        const int base = 3 * index;
 
-    cudssHandle_t d_cudssHandle = nullptr;
-};
+        sum = a[base]     * b[base]
+            + a[base + 1] * b[base + 1]
+            + a[base + 2] * b[base + 2];
+    }
 
+    sums[tid] = sum;
+    __syncthreads();
 
+    for (int stride = blockDim.x / 2;
+         stride > 0;
+         stride /= 2)
+    {
+        if (tid < stride)
+            sums[tid] += sums[tid + stride];
+
+        __syncthreads();
+    }
+
+    if (tid == 0)
+        partial[blockIdx.x] = sums[0];
+}
 __global__ void zeroSelectedDOFsKernel(
     double* vector,
     const int32_t* fixedDOFIds,
@@ -308,7 +544,7 @@ __global__ void dampedJacobiSmootherKernelFine(
         // rTilde = weightFactorJacobi * r ./ diagK
         x[idx] = weightFactorJacobi * (r[idx] / diagK[idx]);
     }
-    rTilde = x;
+    (void)rTilde;  // The kernel writes x; assigning a pointer here would not update the caller.
 }
 
 __global__ void dampedJacobiSmootherKernelCoarse(
@@ -397,9 +633,7 @@ __global__ void kbyu_kernel(
             if (n == node)
                 localNode = j;
         }
-        /*// If this happens, nodeToElements/eNodMat are inconsistent.
-        if (localNode < 0)
-            continue;*/
+        if (localNode < 0) continue;
 
         // Build element displacement vector Ue
         #pragma unroll
@@ -756,6 +990,42 @@ __global__ void restrictResidualKernel(
 
 }
 
+__global__ void gatherGlobalCoarseResidualKernel(
+    const double* __restrict__ localResidual,
+    double* __restrict__ globalResidual,
+    const int32_t* __restrict__ globalNodeIds,
+    const uint8_t* __restrict__ ownedMask,
+    int numLocalNodes)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= numLocalNodes || !ownedMask[i]) return;
+    const int src = 3 * i;
+    const int dst = 3 * (globalNodeIds[i] - 1);
+    // A unique global-node owner is validated during host initialization.
+    globalResidual[dst]     = localResidual[src];
+    globalResidual[dst + 1] = localResidual[src + 1];
+    globalResidual[dst + 2] = localResidual[src + 2];
+}
+
+__global__ void scatterGlobalCoarseResidualKernel(
+    double* __restrict__ sendBuffer,
+    const double* __restrict__ globalResidual,
+    const int32_t* __restrict__ globalNodeIds,
+    int numLocalNodes)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= numLocalNodes)
+        return;
+
+    int src = 3 * (globalNodeIds[i] - 1);
+    int dst = 3 * i;
+
+    sendBuffer[dst]     = globalResidual[src];
+    sendBuffer[dst + 1] = globalResidual[src + 1];
+    sendBuffer[dst + 2] = globalResidual[src + 2];
+}
+
 static int gridSizeFor(
     int count,
     int blockSize)
@@ -796,1118 +1066,1003 @@ static void addBytes(
         checkedMultiply(count, elementSize));
 }
 
-static const mxArray* requireField(
-    const mxArray* structure,
-    const char* fieldName)
+static const mxArray* requireField(const mxArray* structure, const char* name)
 {
-    const mxArray* field = mxGetField(structure, 0, fieldName);
-
-    if (field == nullptr)
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:missingField",
-            "H.%s is required.",
-            fieldName);
-    }
-
-    return field;
-}
-
-static const mxArray* requireCellEntry(
-    const mxArray* cellArray,
-    mwIndex index,
-    const char* fieldName)
-{
-    if (!mxIsCell(cellArray))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:cellField",
-            "H.%s must be a cell array.",
-            fieldName);
-    }
-
-    if (index >= mxGetNumberOfElements(cellArray))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:cellSize",
-            "H.%s does not contain hierarchy level %llu.",
-            fieldName,
-            static_cast<unsigned long long>(index + 1));
-    }
-
-    const mxArray* value = mxGetCell(cellArray, index);
-
-    if (value == nullptr)
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:emptyCell",
-            "H.%s{%llu} is empty.",
-            fieldName,
-            static_cast<unsigned long long>(index + 1));
-    }
-
+    const mxArray* value = mxGetField(structure,0,name);
+    if (!value) throw std::runtime_error(std::string("Missing field ")+name);
     return value;
 }
-
-static void requireRealDoubleArray(
-    const mxArray* value,
-    mwSize requiredElements,
-    const char* description)
+static const mxArray* requireCellEntry(const mxArray* cell, mwIndex index,
+                                        const char* fieldName)
 {
-    if (!mxIsDouble(value) || mxIsComplex(value) || mxGetNumberOfElements(value) != requiredElements)
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:doubleArray",
-            "%s must be a real double array with %llu entries.",
-            description,
-            static_cast<unsigned long long>(requiredElements));
-    }
+    if (!mxIsCell(cell) || index >= mxGetNumberOfElements(cell))
+        throw std::runtime_error(std::string(fieldName)+" must contain all hierarchy levels.");
+    const mxArray* entry = mxGetCell(cell,index);
+    if (!entry) throw std::runtime_error(std::string(fieldName)+" has an empty cell.");
+    return entry;
+}
+static void requireRealDoubleArray(const mxArray* value, mwSize n, const char* what)
+{
+    if (!value || !mxIsDouble(value) || mxIsComplex(value) || mxGetNumberOfElements(value)!=n)
+        throw std::runtime_error(std::string(what)+" must be a real double array of the required size.");
+}
+static void requireInt32Array(const mxArray* value, mwSize n, const char* what)
+{
+    if (!value || !mxIsInt32(value) || mxIsComplex(value) || mxGetNumberOfElements(value)!=n)
+        throw std::runtime_error(std::string(what)+" must be an int32 array of the required size.");
+}
+static int readPositiveIntegerScalar(const mxArray* value, const char* what)
+{
+    if (!value || !mxIsNumeric(value) || mxIsComplex(value) || mxGetNumberOfElements(value)!=1)
+        throw std::runtime_error(std::string(what)+" must be a positive numeric scalar.");
+    const double x=mxGetScalar(value);
+    if (!std::isfinite(x) || x<1 || x>double(INT_MAX) || std::floor(x)!=x)
+        throw std::runtime_error(std::string(what)+" must be a positive integer within int32 range.");
+    return int(x);
+}
+static void validateOneBasedIds(const int32_t* ids,size_t count,int upperBound,
+                                bool zeroAllowed,const char* what)
+{
+    for (size_t i=0;i<count;++i)
+        if (ids[i]>(int32_t)upperBound || ids[i]<(zeroAllowed?0:1))
+            throw std::runtime_error(std::string(what)+" has invalid one-based indices.");
 }
 
-static void requireInt32Array(
-    const mxArray* value,
-    mwSize requiredElements,
-    const char* description)
+// Partition contract: H.partitions is a cell array of per-GPU hierarchy structs.
+// Per-GPU fields match the single-GPU hierarchy, plus globalNodeIds{level},
+// optionally ownedNodeMask{level}, leftHalo/rightHalo{level} and leftInterface/
+// rightInterface (struct or cell). The shared H supplies Ke, jacobiOmega,
+// coarseKFree, coarseFreeDOFIds and global input/output vectors.
+static const mxArray* optionalField(const mxArray* H, const char* name)
 {
-    if (!mxIsInt32(value) || mxIsComplex(value) || mxGetNumberOfElements(value) != requiredElements)
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:int32Array",
-            "%s must be an int32 array with %llu entries.",
-            description,
-            static_cast<unsigned long long>(requiredElements));
-    }
+    return mxGetField(H, 0, name);
 }
 
-static int readPositiveIntegerScalar(
-    const mxArray* value,
-    const char* description)
+static const mxArray* optionalLevelField(const mxArray* H, const char* name,
+                                          int level)
 {
-    if (value == nullptr || mxGetNumberOfElements(value) != 1 || !mxIsNumeric(value) || mxIsComplex(value))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:integerScalar",
-            "%s must be a real numeric scalar.",
-            description);
-    }
-
-    const double scalar = mxGetScalar(value);
-
-    if (!std::isfinite(scalar) || scalar < 1.0 || std::floor(scalar) != scalar || scalar > static_cast<double>(INT_MAX))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:integerScalar",
-            "%s must be a positive integer representable by int.",
-            description);
-    }
-
-    return static_cast<int>(scalar);
+    const mxArray* f = optionalField(H, name);
+    if (!f) return nullptr;
+    return mxIsCell(f) ? (static_cast<mwIndex>(level) < mxGetNumberOfElements(f)
+                           ? mxGetCell(f, level) : nullptr) : (level == 0 ? f : nullptr);
 }
 
-static void validateOneBasedIds(
-    const int32_t* ids,
-    size_t count,
-    int upperBound,
-    bool zeroAllowed,
-    const char* description)
+static std::vector<int32_t> readIndexVector(const mxArray* a, int upper,
+                                             bool allowZero, const char* what)
 {
-    for (size_t i = 0; i < count; ++i)
-    {
-        const int32_t value = ids[i];
-
-        const bool valid =
-            zeroAllowed
-                ? (value >= 0 && value <= upperBound)
-                : (value >= 1 && value <= upperBound);
-
-        if (!valid)
-        {
-            mexErrMsgIdAndTxt(
-                "mgpcg_gpu:indexRange",
-                "%s contains the invalid value %d at linear position %llu.",
-                description,
-                static_cast<int>(value),
-                static_cast<unsigned long long>(i + 1));
-        }
-    }
+    if (!a || !mxIsInt32(a) || mxIsComplex(a) || mxGetNumberOfElements(a) > mwSize(INT_MAX))
+        throw std::runtime_error(std::string(what) + " must be an int32 array.");
+    const size_t count = mxGetNumberOfElements(a);
+    const int32_t* p = static_cast<const int32_t*>(mxGetData(a));
+    validateOneBasedIds(p, count, upper, allowZero, what);
+    return std::vector<int32_t>(p, p + count);
 }
 
-static size_t calculateRequiredGPUBytes(
-    const SolverContext& solver)
+static void readSideIndices(const mxArray* sideMx, HaloSide& side,
+                            int ownNodes, const char* description)
+{
+    if (!sideMx || mxIsEmpty(sideMx)) return;
+    if (!mxIsStruct(sideMx) || mxGetNumberOfElements(sideMx) != 1)
+        throw std::runtime_error(std::string(description) + " must be a scalar struct.");
+    const mxArray* send = mxGetField(sideMx, 0, "sendLocal");
+    const mxArray* dest = mxGetField(sideMx, 0, "sendDestLocal");
+    if (!send || !dest)
+        throw std::runtime_error(std::string(description) + " needs sendLocal and sendDestLocal.");
+    side.sendLocal = readIndexVector(send, ownNodes, false, description);
+    // Destination indices checked against receiver after all partitions parsed.
+    side.sendDestLocal = readIndexVector(dest, INT_MAX, false, description);
+    if (side.sendLocal.size() != side.sendDestLocal.size())
+        throw std::runtime_error(std::string(description) + " index counts disagree.");
+}
+
+static void readSideIndices(const mxArray* sideMx, InterfaceSide& side,
+                            int ownNodes, const char* description)
+{
+    if (!sideMx || mxIsEmpty(sideMx)) return;
+    if (!mxIsStruct(sideMx) || mxGetNumberOfElements(sideMx) != 1)
+        throw std::runtime_error(std::string(description) + " must be a scalar struct.");
+    const mxArray* send = mxGetField(sideMx, 0, "sendLocal");
+    const mxArray* dest = mxGetField(sideMx, 0, "sendDestLocal");
+    if (!send || !dest)
+        throw std::runtime_error(std::string(description) + " needs sendLocal and sendDestLocal.");
+    side.sendLocal = readIndexVector(send, ownNodes, false, description);
+    side.sendDestLocal = readIndexVector(dest, INT_MAX, false, description);
+    if (side.sendLocal.size() != side.sendDestLocal.size())
+        throw std::runtime_error(std::string(description) + " index counts disagree.");
+}
+
+static size_t calculateRequiredGPUBytes(const singleGPUData& G)
 {
     size_t bytes = 0;
-
-    // Double arrays first so every double pointer remains naturally aligned.
-    addBytes(bytes, static_cast<size_t>(solver.levels[0].numElements), sizeof(double)); // finest eleModulus
-
-    for (int levelIndex = 0; levelIndex < solver.numLevels - 1; ++levelIndex)
-    {
-        addBytes(bytes, static_cast<size_t>(solver.levels[levelIndex].numDOFs), sizeof(double)); // diagK
+    const Level& fine = G.levels.front();
+    addBytes(bytes, fine.numElements, sizeof(double));
+    for (int l = 0; l + 1 < G.numLevels; ++l)
+        addBytes(bytes, G.levels[l].numDOFs, sizeof(double));
+    addBytes(bytes, 4 * size_t(fine.numDOFs), sizeof(double));
+    for (int l = 1; l < G.numLevels; ++l)
+        addBytes(bytes, 2 * size_t(G.levels[l].numDOFs), sizeof(double));
+    addBytes(bytes, G.partialCount + 1, sizeof(double));
+    for (const Level& L : G.levels)
+        for (const HaloSide* p : {&L.left, &L.right})
+            addBytes(bytes, 3 * p->sendLocal.size(), sizeof(double));
+    for (const InterfaceSide* p : {&fine.leftInterface, &fine.rightInterface}) {
+        addBytes(bytes, 3 * p->sendLocal.size(), sizeof(double));
+        addBytes(bytes, 3 * size_t(p->recvCount), sizeof(double));
     }
-
-    const size_t finestDOFs = static_cast<size_t>(solver.levels[0].numDOFs);
-
-    addBytes(bytes, 4 * finestDOFs, sizeof(double)); // y, r, p, Ap
-    addBytes(bytes, 2 * static_cast<size_t>(solver.numCoarseFreeDOFs), sizeof(double)); // reduced coarse RHS and x
-    addBytes(bytes, static_cast<size_t>(solver.coarseNNZ), sizeof(double)); // coarse matrix values
-
-    // Finest rhs aliases d_r and finest x aliases d_Ap.
-    // Therefore separate rhs/x storage is needed only for levels 1...N-1.
-    for (int levelIndex = 1; levelIndex < solver.numLevels; ++levelIndex)
-    {
-        addBytes(
-            bytes,
-            2 * static_cast<size_t>(solver.levels[levelIndex].numDOFs),
-            sizeof(double));
+    addBytes(bytes, 8 * size_t(fine.numNodes), sizeof(int32_t));
+    addBytes(bytes, 8 * size_t(fine.numElements), sizeof(int32_t));
+    for (const Level& L : G.levels) {
+        addBytes(bytes, L.numNodes, sizeof(int32_t));
+        addBytes(bytes, L.numGridNodes, sizeof(int32_t));
     }
-
-    const Level& finest = solver.levels[0];
-
-    // eNodMat and nodeToElements.
-    addBytes(
-        bytes,
-        static_cast<size_t>(finest.numNodes) * 8,
-        sizeof(int32_t));
-
-    addBytes(
-        bytes,
-        static_cast<size_t>(finest.numElements) * 8,
-        sizeof(int32_t));
-
-    // Integer arrays follow all doubles.
-    for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
-    {
-        const Level& level = solver.levels[levelIndex];
-
-        addBytes(bytes, static_cast<size_t>(level.numNodes), sizeof(int32_t));
-        addBytes(bytes, level.numGridNodes, sizeof(int32_t));
+    addBytes(bytes, G.numFixedDOFs, sizeof(int32_t));
+    for (const Level& L : G.levels)
+        for (const HaloSide* p : {&L.left, &L.right})
+            addBytes(bytes, p->sendLocal.size(), sizeof(int32_t));
+    for (const InterfaceSide* p : {&fine.leftInterface, &fine.rightInterface}) {
+        addBytes(bytes, p->sendLocal.size(), sizeof(int32_t));
+        addBytes(bytes, p->recvCount, sizeof(int32_t));
     }
-
-    addBytes(bytes, static_cast<size_t>(solver.numFixedDOFs), sizeof(int32_t));
-    addBytes(bytes, static_cast<size_t>(solver.numCoarseFreeDOFs), sizeof(int32_t));
-    addBytes(bytes, static_cast<size_t>(solver.numCoarseFreeDOFs) + 1, sizeof(int32_t));
-    addBytes(bytes, static_cast<size_t>(solver.coarseNNZ), sizeof(int32_t));
-
+    for (const Level& L : G.levels) addBytes(bytes, L.numNodes, sizeof(uint8_t));
     return bytes;
 }
 
-static void initializeGPUHierarchy(
-    SolverContext& solver,
-    const mxArray* hierarchyMx,
-    const mxArray* bMx,
-    const mxArray* yMx,
-    double tolerance,
-    int maxIterations)
+static void initializeGPUHierarchy(std::vector<singleGPUData>& Gs,
+                                    GlobalCoarseSolve& C, const mxArray* H,
+                                    const mxArray* bMx, const mxArray* yMx,
+                                    double tolerance, int maxIterations)
 {
-    if (hierarchyMx == nullptr ||!mxIsStruct(hierarchyMx) ||mxGetNumberOfElements(hierarchyMx) != 1)
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:hierarchy",
-            "H must be a scalar MATLAB struct.");
-    }
+    if (!H || !mxIsStruct(H) || mxGetNumberOfElements(H) != 1)
+        throw std::runtime_error("H must be a scalar struct.");
+    if (!mxIsDouble(bMx) || mxIsComplex(bMx) || !mxIsDouble(yMx) ||
+        mxIsComplex(yMx) || mxGetNumberOfElements(bMx) != mxGetNumberOfElements(yMx) ||
+        mxGetNumberOfElements(bMx) == 0 || mxGetNumberOfElements(bMx) % 3)
+        throw std::runtime_error("b and y0 must be equal-length real double arrays of 3 DOFs/node.");
+    if (!(tolerance > 0.0) || !std::isfinite(tolerance) || maxIterations <= 0)
+        throw std::runtime_error("Invalid tolerance or maxIterations.");
+    if (mxGetNumberOfElements(bMx) > mwSize(INT_MAX))
+        throw std::runtime_error("Global fine vector exceeds int32 indexing limits.");
 
-    if (!mxIsDouble(bMx) ||mxIsComplex(bMx) ||!mxIsDouble(yMx) ||mxIsComplex(yMx))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:inputType",
-            "b and y0 must be real double arrays.");
-    }
+    const mxArray* parts = requireField(H, "partitions");
+    if (!mxIsCell(parts) || mxGetNumberOfElements(parts) == 0 ||
+        mxGetNumberOfElements(parts) > mwSize(INT_MAX))
+        throw std::runtime_error("H.partitions must be a nonempty cell array.");
+    const int ng = static_cast<int>(mxGetNumberOfElements(parts));
+    if (const mxArray* declared = optionalField(H, "numGPUs"))
+        if (readPositiveIntegerScalar(declared, "H.numGPUs") != ng)
+            throw std::runtime_error("H.numGPUs differs from numel(H.partitions).");
+    int available = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&available));
+    if (ng > available)
+        throw std::runtime_error("Not enough CUDA devices for H.partitions.");
 
-    if (!std::isfinite(tolerance) || tolerance <= 0.0)
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:tolerance",
-            "tolerance must be finite and positive.");
-    }
+    const mxArray* omegaMx = optionalField(H, "jacobiOmega");
+    if (!omegaMx) omegaMx = requireField(H, "weightFactorJacobi");
+    if (!mxIsDouble(omegaMx) || mxIsComplex(omegaMx) || mxGetNumberOfElements(omegaMx) != 1)
+        throw std::runtime_error("H.jacobiOmega must be a real scalar.");
+    const double omega = mxGetScalar(omegaMx);
+    if (!std::isfinite(omega)) throw std::runtime_error("Jacobi weight is not finite.");
+    const mxArray* ke = requireField(H, "Ke");
+    requireRealDoubleArray(ke, 24*24, "H.Ke");
+    const double* Ke = static_cast<const double*>(mxGetData(ke));
+    const size_t globalFineNodes = mxGetNumberOfElements(bMx) / 3;
+    const double* b = static_cast<const double*>(mxGetData(bMx));
+    const double* y = static_cast<const double*>(mxGetData(yMx));
 
-    if (maxIterations <= 0)
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:maxIterations",
-            "maxIterations must be a positive integer.");
-    }
+    Gs.resize(ng);
+    int nlev = -1;
+    for (int g = 0; g < ng; ++g) {
+        const mxArray* P = mxGetCell(parts, g);
+        if (!P || !mxIsStruct(P) || mxGetNumberOfElements(P) != 1)
+            throw std::runtime_error("Each H.partitions entry must be a scalar struct.");
+        singleGPUData& G = Gs[g];
+        G.deviceId = g; G.numGPUs = ng;
+        G.tolerance = tolerance; G.maxIterations = maxIterations;
+        G.jacobiOmega = omega; G.h_Ke = Ke;
+        G.numLevels = readPositiveIntegerScalar(requireField(P, "numLevels"), "partition.numLevels");
+        if (G.numLevels < 2 || (nlev != -1 && nlev != G.numLevels))
+            throw std::runtime_error("All partitions must use the same number of levels (at least 2).");
+        nlev = G.numLevels;
+        G.levels.resize(G.numLevels);
+        G.spanWidths.resize(G.numLevels-1);
 
-    const int numLevels =
-        readPositiveIntegerScalar(
-            requireField(hierarchyMx, "numLevels"),
-            "H.numLevels");
-
-    if (numLevels < 2)
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:numLevels",
-            "At least two multigrid levels are required.");
-    }
-
-    const mxArray* resXField = requireField(hierarchyMx, "resX");
-    const mxArray* resYField = requireField(hierarchyMx, "resY");
-    const mxArray* resZField = requireField(hierarchyMx, "resZ");
-    const mxArray* numNodesField = requireField(hierarchyMx, "numNodes");
-    const mxArray* numElementsField = requireField(hierarchyMx, "numElements");
-    const mxArray* numDOFsField = requireField(hierarchyMx, "numDOFs");
-    const mxArray* spanWidthField = requireField(hierarchyMx, "spanWidth");
-
-    requireInt32Array(resXField,static_cast<mwSize>(numLevels),"H.resX");
-    requireInt32Array(resYField,static_cast<mwSize>(numLevels),"H.resY");
-    requireInt32Array(resZField,static_cast<mwSize>(numLevels),"H.resZ");
-    requireInt32Array(numNodesField,static_cast<mwSize>(numLevels),"H.numNodes");
-    requireInt32Array(numElementsField,static_cast<mwSize>(numLevels),"H.numElements");
-    requireInt32Array(numDOFsField,static_cast<mwSize>(numLevels),"H.numDOFs");
-    requireInt32Array(spanWidthField,static_cast<mwSize>(numLevels - 1),"H.spanWidth");
-
-    const int32_t* resX = static_cast<const int32_t*>(mxGetData(resXField));
-    const int32_t* resY = static_cast<const int32_t*>(mxGetData(resYField));
-    const int32_t* resZ = static_cast<const int32_t*>(mxGetData(resZField));
-    const int32_t* numNodes = static_cast<const int32_t*>(mxGetData(numNodesField));
-    const int32_t* numElements = static_cast<const int32_t*>(mxGetData(numElementsField));
-    const int32_t* numDOFs = static_cast<const int32_t*>(mxGetData(numDOFsField));
-    const int32_t* spanWidth = static_cast<const int32_t*>(mxGetData(spanWidthField));
-
-    const mxArray* nodeToElementsField = requireField(hierarchyMx, "nodeToElements");
-    const mxArray* eNodMatField = requireField(hierarchyMx, "eNodMat");
-    const mxArray* nodGridIdField = requireField(hierarchyMx, "nodGridId");
-    const mxArray* nodMapForwardField = requireField(hierarchyMx, "nodMapForward");
-    const mxArray* eleModulusField = requireField(hierarchyMx, "eleModulus");
-    const mxArray* diagKField = requireField(hierarchyMx, "diagK");
-
-    if (!mxIsCell(nodeToElementsField) ||
-        mxGetNumberOfElements(nodeToElementsField) < static_cast<mwSize>(numLevels) ||
-        !mxIsCell(eNodMatField) ||
-        mxGetNumberOfElements(eNodMatField) < static_cast<mwSize>(numLevels) ||
-        !mxIsCell(nodGridIdField) ||
-        mxGetNumberOfElements(nodGridIdField) < static_cast<mwSize>(numLevels) ||
-        !mxIsCell(nodMapForwardField) ||
-        mxGetNumberOfElements(nodMapForwardField) < static_cast<mwSize>(numLevels) ||
-        !mxIsCell(eleModulusField) ||
-        mxGetNumberOfElements(eleModulusField) < 1 ||
-        !mxIsCell(diagKField) ||
-        mxGetNumberOfElements(diagKField) < static_cast<mwSize>(numLevels - 1))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:hierarchyCells",
-            "Hierarchy cell fields do not contain the required number of levels.");
-    }
-
-    const mxArray* jacobiOmegaMx = mxGetField(hierarchyMx, 0, "jacobiOmega");
-
-    if (jacobiOmegaMx == nullptr)
-        jacobiOmegaMx = mxGetField(hierarchyMx, 0, "weightFactorJacobi");
-
-    if (jacobiOmegaMx == nullptr ||
-        !mxIsDouble(jacobiOmegaMx) ||
-        mxIsComplex(jacobiOmegaMx) ||
-        mxGetNumberOfElements(jacobiOmegaMx) != 1)
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:jacobiOmega",
-            "H must contain scalar jacobiOmega or weightFactorJacobi.");
-    }
-
-    const double jacobiOmega = mxGetScalar(jacobiOmegaMx);
-
-    if (!std::isfinite(jacobiOmega))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:jacobiOmega",
-            "The Jacobi weight must be finite.");
-    }
-
-    solver.initialized = false;
-    solver.numLevels = numLevels;
-    solver.levels.assign(static_cast<size_t>(numLevels),Level{});
-    solver.spanWidths.resize(static_cast<size_t>(numLevels - 1));
-
-    solver.tolerance = tolerance;
-    solver.maxIterations = maxIterations;
-    solver.jacobiOmega = jacobiOmega;
-    solver.h_b =static_cast<const double*>(mxGetData(bMx));
-    solver.h_y =static_cast<const double*>(mxGetData(yMx));
-    solver.outputRows = mxGetM(bMx);
-    solver.outputCols = mxGetN(bMx);
-
-    for (int levelIndex = 0;levelIndex < numLevels;++levelIndex)
-    {
-        Level& level =
-            solver.levels[levelIndex];
-
-        level.nx = static_cast<int>(resX[levelIndex]);
-        level.ny = static_cast<int>(resY[levelIndex]);
-        level.nz = static_cast<int>(resZ[levelIndex]);
-        level.numNodes =static_cast<int>(numNodes[levelIndex]);
-        level.numElements =static_cast<int>(numElements[levelIndex]);
-        level.numDOFs =static_cast<int>(numDOFs[levelIndex]);
-
-        if (level.nx < 0 ||
-            level.ny < 0 ||
-            level.nz < 0 ||
-            level.numNodes <= 0 ||
-            level.numElements <= 0 ||
-            level.numDOFs <= 0)
-        {
-            mexErrMsgIdAndTxt(
-                "mgpcg_gpu:levelDimensions",
-                "Hierarchy level %d contains invalid dimensions or counts.",
-                levelIndex + 1);
+        const char* names[] = {"resX", "resY", "resZ", "numNodes", "numElements", "numDOFs", "spanWidth"};
+        const int32_t* arrays[7];
+        for (int f=0; f<7; ++f) {
+            const mxArray* a = requireField(P, names[f]);
+            requireInt32Array(a, f==6 ? nlev-1 : nlev, names[f]);
+            arrays[f] = static_cast<const int32_t*>(mxGetData(a));
         }
-
-        if (level.numDOFs != 3 * level.numNodes)
-        {
-            mexErrMsgIdAndTxt(
-                "mgpcg_gpu:numDOFs",
-                "H.numDOFs(%d) must equal 3*H.numNodes(%d).",
-                levelIndex + 1,
-                levelIndex + 1);
+        const mxArray* nodesToElem = requireField(P,"nodeToElements");
+        const mxArray* elemNodes = requireField(P,"eNodMat");
+        const mxArray* gridIds = requireField(P,"nodGridId");
+        const mxArray* map = requireField(P,"nodMapForward");
+        const mxArray* modulus = requireField(P,"eleModulus");
+        const mxArray* diagonal = requireField(P,"diagK");
+        const mxArray* globalIds = requireField(P,"globalNodeIds");
+        if (!mxIsCell(globalIds) || mxGetNumberOfElements(globalIds)<mwSize(nlev))
+            throw std::runtime_error("partition.globalNodeIds must be a cell array, one vector per level.");
+        for (int l=0; l<nlev; ++l) {
+            Level& L=G.levels[l];
+            L.nx=arrays[0][l]; L.ny=arrays[1][l]; L.nz=arrays[2][l];
+            L.numNodes=arrays[3][l]; L.numElements=arrays[4][l]; L.numDOFs=arrays[5][l];
+            if (L.nx<0 || L.ny<0 || L.nz<0 || L.numNodes<=0 || L.numElements<=0 ||
+                L.numNodes > INT_MAX/3 || L.numDOFs != 3*L.numNodes)
+                throw std::runtime_error("Invalid partition level dimensions.");
+            L.numGridNodes=checkedMultiply(checkedMultiply(size_t(L.nx)+1,
+                                  size_t(L.ny)+1),size_t(L.nz)+1);
+            if (L.numGridNodes>size_t(INT_MAX))
+                throw std::runtime_error("Partition grid exceeds int32 indexing limits.");
+            const mxArray* nodesMx = requireCellEntry(nodesToElem,l,"nodeToElements");
+            const mxArray* elemMx = requireCellEntry(elemNodes,l,"eNodMat");
+            const mxArray* gridMx = requireCellEntry(gridIds,l,"nodGridId");
+            const mxArray* mapMx = requireCellEntry(map,l,"nodMapForward");
+            requireInt32Array(nodesMx,size_t(L.numNodes)*8,"partition.nodeToElements{l}");
+            requireInt32Array(elemMx,size_t(L.numElements)*8,"partition.eNodMat{l}");
+            requireInt32Array(gridMx,L.numNodes,"partition.nodGridId{l}");
+            requireInt32Array(mapMx,L.numGridNodes,"partition.nodMapForward{l}");
+            L.h_nodeToElements=static_cast<const int32_t*>(mxGetData(nodesMx));
+            L.h_eNodMat=static_cast<const int32_t*>(mxGetData(elemMx));
+            L.h_nodGridId=static_cast<const int32_t*>(mxGetData(gridMx));
+            L.h_nodMapForward=static_cast<const int32_t*>(mxGetData(mapMx));
+            validateOneBasedIds(L.h_nodGridId,L.numNodes,int(L.numGridNodes),false,"nodGridId");
+            validateOneBasedIds(L.h_nodMapForward,L.numGridNodes,L.numNodes,true,"nodMapForward");
+            L.globalNodeIds=readIndexVector(requireCellEntry(globalIds,l,"globalNodeIds"),
+                                             INT_MAX,false,"globalNodeIds");
+            if (L.globalNodeIds.size()!=size_t(L.numNodes))
+                throw std::runtime_error("globalNodeIds length differs from local numNodes.");
+            L.h_globalNodeIds=L.globalNodeIds.data();
+            if (l==0)
+                validateOneBasedIds(L.h_globalNodeIds,L.numNodes,int(globalFineNodes),false,"fine globalNodeIds");
+            if (const mxArray* m = optionalLevelField(P,"ownedNodeMask",l)) {
+                if ((!mxIsLogical(m) && !mxIsUint8(m)) || mxGetNumberOfElements(m)!=mwSize(L.numNodes))
+                    throw std::runtime_error("ownedNodeMask{level} must be logical/uint8 of numNodes length.");
+                const uint8_t* ptr=static_cast<const uint8_t*>(mxGetData(m));
+                L.ownedMask.assign(ptr,ptr+L.numNodes);
+                for (uint8_t value : L.ownedMask)
+                    if (value>1) throw std::runtime_error("ownedNodeMask entries must be 0 or 1.");
+                L.explicitOwnership=true;
+            }
+            if (l<nlev-1) {
+                const mxArray* d= requireCellEntry(diagonal,l,"diagK");
+                requireRealDoubleArray(d,L.numDOFs,"partition.diagK{l}");
+                L.h_dK=static_cast<const double*>(mxGetData(d));
+                for (int i=0;i<L.numDOFs;++i)
+                    if (!std::isfinite(L.h_dK[i]) || L.h_dK[i]==0.0)
+                        throw std::runtime_error("diagK has a zero/non-finite entry.");
+                G.spanWidths[l]=arrays[6][l];
+                if (G.spanWidths[l]<=0)
+                    throw std::runtime_error("spanWidth must be positive.");
+            }
+            L.left.neighborGPU=g>0 ? g-1 : -1;
+            L.right.neighborGPU=g+1<ng ? g+1 : -1;
+            readSideIndices(optionalLevelField(P,"leftHalo",l),L.left,L.numNodes,"leftHalo");
+            readSideIndices(optionalLevelField(P,"rightHalo",l),L.right,L.numNodes,"rightHalo");
+            if ((g==0 && !L.left.sendLocal.empty()) ||
+                (g==ng-1 && !L.right.sendLocal.empty()))
+                throw std::runtime_error("Halo declared on an external boundary.");
         }
-
-        const size_t nyNodes =static_cast<size_t>(level.ny) + 1;
-        const size_t nxNodes =static_cast<size_t>(level.nx) + 1;
-        const size_t nzNodes =static_cast<size_t>(level.nz) + 1;
-
-        level.numGridNodes =checkedMultiply(checkedMultiply(nyNodes, nxNodes),nzNodes);
-
-        if (level.numGridNodes >
-            static_cast<size_t>(INT_MAX))
-        {
-            mexErrMsgIdAndTxt(
-                "mgpcg_gpu:gridIndexRange",
-                "Hierarchy level %d has more grid nodes than the int-based transfer kernels support.",
-                levelIndex + 1);
+        Level& fine = G.levels.front();
+        const mxArray* e= requireCellEntry(modulus,0,"eleModulus");
+        requireRealDoubleArray(e,fine.numElements,"partition.eleModulus{1}");
+        fine.h_eleModulus=static_cast<const double*>(mxGetData(e));
+        validateOneBasedIds(fine.h_nodeToElements,size_t(fine.numNodes)*8,
+                            fine.numElements,true,"nodeToElements{1}");
+        validateOneBasedIds(fine.h_eNodMat,size_t(fine.numElements)*8,
+                            fine.numNodes,false,"eNodMat{1}");
+        fine.leftInterface.neighborGPU=g>0 ? g-1:-1;
+        fine.rightInterface.neighborGPU=g+1<ng ? g+1:-1;
+        readSideIndices(optionalLevelField(P,"leftInterface",0),fine.leftInterface,
+                        fine.numNodes,"leftInterface");
+        readSideIndices(optionalLevelField(P,"rightInterface",0),fine.rightInterface,
+                        fine.numNodes,"rightInterface");
+        G.partialCount=gridSizeFor(fine.numNodes,256);
+        G.localB.resize(fine.numDOFs); G.localY.resize(fine.numDOFs);
+        for (int node=0;node<fine.numNodes;++node) {
+            const size_t glob=3*size_t(fine.globalNodeIds[node]-1), loc=3*size_t(node);
+            for (int c=0;c<3;++c) {
+                G.localB[loc+c]=b[glob+c];
+                G.localY[loc+c]=y[glob+c];
+            }
         }
-
-        const mxArray* nodeToElementsMx = requireCellEntry(nodeToElementsField,static_cast<mwIndex>(levelIndex),"nodeToElements");
-        const mxArray* eNodMatMx = requireCellEntry(eNodMatField,static_cast<mwIndex>(levelIndex),"eNodMat");
-        const mxArray* nodGridIdMx = requireCellEntry(nodGridIdField,static_cast<mwIndex>(levelIndex),"nodGridId");
-        const mxArray* nodMapForwardMx = requireCellEntry(nodMapForwardField,static_cast<mwIndex>(levelIndex),"nodMapForward");
-
-        requireInt32Array(nodeToElementsMx,static_cast<mwSize>(level.numNodes) * 8,"H.nodeToElements{level}");
-        requireInt32Array(eNodMatMx,static_cast<mwSize>(level.numElements) * 8,"H.eNodMat{level}");
-        requireInt32Array(nodGridIdMx,static_cast<mwSize>(level.numNodes),"H.nodGridId{level}");
-        requireInt32Array(nodMapForwardMx,static_cast<mwSize>(level.numGridNodes),"H.nodMapForward{level}");
-
-        level.h_nodeToElements = static_cast<const int32_t*>(mxGetData(nodeToElementsMx));
-        level.h_eNodMat = static_cast<const int32_t*>(mxGetData(eNodMatMx));
-        level.h_nodGridId = static_cast<const int32_t*>(mxGetData(nodGridIdMx));
-        level.h_nodMapForward = static_cast<const int32_t*>(mxGetData(nodMapForwardMx));
-
-        validateOneBasedIds(
-            level.h_nodGridId,
-            level.numNodes,
-            static_cast<int>(level.numGridNodes),
-            false,
-            "H.nodGridId{level}");
-
-        validateOneBasedIds(
-            level.h_nodMapForward,
-            static_cast<int>(level.numGridNodes),
-            level.numNodes,
-            true,
-            "H.nodMapForward{level}");
-
-        if (levelIndex < numLevels - 1)
-        {
-            const mxArray* diagKMx =
-                requireCellEntry(diagKField,static_cast<mwIndex>(levelIndex),"diagK");
-
-            requireRealDoubleArray(diagKMx,static_cast<mwSize>(level.numDOFs),"H.diagK{level}");
-
-            level.h_dK = static_cast<const double*>(mxGetData(diagKMx));
-
-            for (int dof = 0;dof < level.numDOFs;++dof)
-            {
-                if (!std::isfinite(level.h_dK[dof]) ||level.h_dK[dof] == 0.0)
-                {
-                    mexErrMsgIdAndTxt(
-                        "mgpcg_gpu:diagK",
-                        "H.diagK{%d} contains a zero or non-finite value at entry %d.",
-                        levelIndex + 1,
-                        dof + 1);
+        G.h_b=G.localB.data(); G.h_y=G.localY.data();
+        if (const mxArray* f=optionalField(P,"fixedDOFIds")) {
+            G.fixedDOFIds=readIndexVector(f,fine.numDOFs,false,"partition.fixedDOFIds");
+        } else if (const mxArray* f=optionalField(H,"fixedDOFIds")) {
+            const std::vector<int32_t> globalFixed=
+                readIndexVector(f,int(mxGetNumberOfElements(bMx)),false,"H.fixedDOFIds");
+            const std::unordered_set<int32_t> fset(globalFixed.begin(),globalFixed.end());
+            for (int i=0;i<fine.numNodes;++i) {
+                for (int c=0;c<3;++c) {
+                    const int32_t globalId=3*(fine.globalNodeIds[i]-1)+c+1;
+                    if (fset.count(globalId)) G.fixedDOFIds.push_back(3*i+c+1);
                 }
             }
+        }
+        G.numFixedDOFs=static_cast<int>(G.fixedDOFIds.size());
+        G.h_fixedDOFIds=G.fixedDOFIds.data();
+    }
 
-            const int width = static_cast<int>(spanWidth[levelIndex]);
-
-            if (width <= 0)
-            {
-                mexErrMsgIdAndTxt(
-                    "mgpcg_gpu:spanWidth",
-                    "H.spanWidth(%d) must be positive.",
-                    levelIndex + 1);
+    // Honor all explicitly supplied owners first, then assign unclaimed nodes
+    // to the first partition containing them. Exactly one owner per global ID.
+    for (int l=0;l<nlev;++l) {
+        std::unordered_set<int32_t> assigned;
+        for (singleGPUData& G : Gs) {
+            const Level& L=G.levels[l];
+            if (!L.explicitOwnership) continue;
+            for (int i=0;i<L.numNodes;++i)
+                if (L.ownedMask[i] && !assigned.insert(L.globalNodeIds[i]).second)
+                    throw std::runtime_error("A global node has multiple explicit owners.");
+        }
+        for (singleGPUData& G : Gs) {
+            Level& L=G.levels[l];
+            if (!L.explicitOwnership) {
+                L.ownedMask.resize(L.numNodes);
+                for (int i=0;i<L.numNodes;++i)
+                    L.ownedMask[i]=uint8_t(assigned.insert(L.globalNodeIds[i]).second);
             }
+            L.h_ownedNodeMask=L.ownedMask.data();
+        }
+        for (const singleGPUData& G: Gs)
+            for (int32_t id : G.levels[l].globalNodeIds)
+                if (!assigned.count(id))
+                    throw std::runtime_error("A global node has no owning partition.");
+    }
+    {
+        std::unordered_set<int32_t> owners;
+        for (const auto& G:Gs) {
+            const Level& L=G.levels[0];
+            for (int i=0;i<L.numNodes;++i)
+                if (L.ownedMask[i]) owners.insert(L.globalNodeIds[i]);
+        }
+        if (owners.size()!=globalFineNodes)
+            throw std::runtime_error("Global finest b/y0 contains nodes not owned by a partition.");
+    }
 
-            solver.spanWidths[levelIndex] = width;
+    // Cross-check that peer copy mappings refer to the same global node.
+    for (int g=0;g<ng;++g) {
+        for (int l=0;l<nlev;++l) {
+            Level& L=Gs[g].levels[l];
+            for (bool right : {false,true}) {
+                HaloSide& S=right?L.right:L.left;
+                if (S.sendLocal.empty()) continue;
+                const Level& dst=Gs[S.neighborGPU].levels[l];
+                for (size_t j=0;j<S.sendLocal.size();++j) {
+                    const int a=S.sendLocal[j]-1,b=S.sendDestLocal[j]-1;
+                    if (b<0 || b>=dst.numNodes ||
+                        L.globalNodeIds[a]!=dst.globalNodeIds[b])
+                        throw std::runtime_error("Halo source and receiver global IDs disagree.");
+                    if (j && S.sendDestLocal[j]!=S.sendDestLocal[j-1]+1)
+                        throw std::runtime_error("Halo destination indices must be contiguous.");
+                }
+            }
+        }
+        Level& L=Gs[g].levels[0];
+        for (bool right : {false,true}) {
+            InterfaceSide& S=right?L.rightInterface:L.leftInterface;
+            if (S.sendLocal.empty()) continue;
+            if (S.neighborGPU<0) throw std::runtime_error("Interface on an external boundary.");
+            const Level& dst=Gs[S.neighborGPU].levels[0];
+            for (size_t j=0;j<S.sendLocal.size();++j) {
+                const int a=S.sendLocal[j]-1,b=S.sendDestLocal[j]-1;
+                if (b<0 || b>=dst.numNodes ||
+                    L.globalNodeIds[a]!=dst.globalNodeIds[b])
+                    throw std::runtime_error("Interface source and destination global IDs disagree.");
+            }
         }
     }
-
-    const mxArray* eleModulusMx = requireCellEntry(eleModulusField,0,"eleModulus");
-
-    requireRealDoubleArray(eleModulusMx,static_cast<mwSize>(solver.levels[0].numElements),"H.eleModulus{1}");
-
-    solver.levels[0].h_eleModulus = static_cast<const double*>(mxGetData(eleModulusMx));
-
-    // The unchanged K-by-U kernel relies on valid one-based connectivity.
-    validateOneBasedIds(
-        solver.levels[0].h_nodeToElements,
-        static_cast<size_t>(solver.levels[0].numNodes) * 8,
-        solver.levels[0].numElements,
-        true,
-        "H.nodeToElements{1}");
-
-    validateOneBasedIds(
-        solver.levels[0].h_eNodMat,
-        static_cast<size_t>(solver.levels[0].numElements) * 8,
-        solver.levels[0].numNodes,
-        false,
-        "H.eNodMat{1}");
-
-    const mxArray* fixedDOFIdsMx = requireField(hierarchyMx, "fixedDOFIds");
-
-    if (!mxIsInt32(fixedDOFIdsMx) || mxIsComplex(fixedDOFIdsMx) || mxGetNumberOfElements(fixedDOFIdsMx) > static_cast<mwSize>(INT_MAX))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:fixedDOFIds",
-            "H.fixedDOFIds must be an int32 array with at most INT_MAX entries.");
+    for (int g=0;g<ng;++g) {
+        Level& L=Gs[g].levels.front();
+        if (g>0) L.leftInterface.recvLocal=Gs[g-1].levels.front().rightInterface.sendDestLocal;
+        if (g+1<ng) L.rightInterface.recvLocal=Gs[g+1].levels.front().leftInterface.sendDestLocal;
+        L.leftInterface.recvCount=int(L.leftInterface.recvLocal.size());
+        L.rightInterface.recvCount=int(L.rightInterface.recvLocal.size());
+        Gs[g].size=calculateRequiredGPUBytes(Gs[g]);
     }
 
-    solver.h_fixedDOFIds = static_cast<const int32_t*>(mxGetData(fixedDOFIdsMx));
-    solver.numFixedDOFs = static_cast<int>(mxGetNumberOfElements(fixedDOFIdsMx));
-
-    if (solver.numFixedDOFs > 0)
-    {
-        validateOneBasedIds(
-            solver.h_fixedDOFIds,
-            solver.numFixedDOFs,
-            solver.levels[0].numDOFs,
-            false,
-            "H.fixedDOFIds");
-    }
-
-    const mxArray* coarseFreeDOFIdsMx = requireField(hierarchyMx, "coarseFreeDOFIds");
-
-    if (!mxIsInt32(coarseFreeDOFIdsMx) ||
-        mxIsComplex(coarseFreeDOFIdsMx) ||
-        mxGetNumberOfElements(coarseFreeDOFIdsMx) == 0 ||
-        mxGetNumberOfElements(coarseFreeDOFIdsMx) >
-            static_cast<mwSize>(INT_MAX))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:coarseFreeDOFIds",
-            "H.coarseFreeDOFIds must be a nonempty int32 array with at most INT_MAX entries.");
-    }
-
-    solver.h_coarseFreeDOFIds = static_cast<const int32_t*>( mxGetData(coarseFreeDOFIdsMx));
-    solver.numCoarseFreeDOFs = static_cast<int>(mxGetNumberOfElements(coarseFreeDOFIdsMx));
-
-    validateOneBasedIds(
-        solver.h_coarseFreeDOFIds,
-        solver.numCoarseFreeDOFs,
-        solver.levels.back().numDOFs,
-        false,
-        "H.coarseFreeDOFIds");
-
-    const mxArray* keMx = requireField(hierarchyMx, "Ke");
-
-    requireRealDoubleArray(keMx,24 * 24, "H.Ke");
-
-    solver.h_Ke =static_cast<const double*>(mxGetData(keMx));
-
-    if (mxGetNumberOfElements(bMx) !=static_cast<mwSize>(solver.levels[0].numDOFs) ||mxGetNumberOfElements(yMx) !=static_cast<mwSize>(solver.levels[0].numDOFs))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:vectorSize",
-            "b and y0 must contain finest-level numDOFs entries.");
-    }
-
-    const mxArray* coarseKFreeMx = requireField(hierarchyMx, "coarseKFree");
-
-    if (!mxIsSparse(coarseKFreeMx) || !mxIsDouble(coarseKFreeMx) || mxIsComplex(coarseKFreeMx))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:coarseKFree",
-            "H.coarseKFree must be a real sparse double matrix.");
-    }
-
-    const mwSize coarseRows = mxGetM(coarseKFreeMx);
-    const mwSize coarseCols = mxGetN(coarseKFreeMx);
-
-    if (coarseRows != coarseCols || coarseRows != static_cast<mwSize>(solver.numCoarseFreeDOFs))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:coarseKFreeSize",
-            "H.coarseKFree must be numCoarseFreeDOFs-by-numCoarseFreeDOFs.");
-    }
-
-    const mwIndex* jc = mxGetJc(coarseKFreeMx);
-    const mwIndex* ir = mxGetIr(coarseKFreeMx);
-    const mwIndex nnz = jc[coarseCols];
-
-    if (coarseRows > static_cast<mwSize>(INT_MAX) || nnz > static_cast<mwIndex>(INT_MAX))
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:coarseKFreeIndexRange",
-            "H.coarseKFree exceeds the int32 CSR limits used by this implementation.");
-    }
-
-    solver.h_coarseRowOffsets.resize(static_cast<size_t>(coarseRows) + 1);
-    solver.h_coarseColIndices.resize(static_cast<size_t>(nnz));
-
-    for (mwSize i = 0; i <= coarseRows; ++i)
-    {
-        solver.h_coarseRowOffsets[i] = static_cast<int32_t>(jc[i]);
-    }
-
-    for (mwIndex i = 0; i < nnz; ++i)
-    {
-        solver.h_coarseColIndices[i] = static_cast<int32_t>(ir[i]);
-    }
-
-    solver.h_coarseValues = static_cast<const double*>(mxGetData(coarseKFreeMx));
-    solver.coarseNNZ = static_cast<int64_t>(nnz);
-    solver.size = calculateRequiredGPUBytes(solver);
+    // Convert MATLAB sparse CSC to cuDSS CSR of transpose (same for SPD K).
+    const mxArray* A=requireField(H,"coarseKFree");
+    if (!mxIsSparse(A) || !mxIsDouble(A) || mxIsComplex(A))
+        throw std::runtime_error("H.coarseKFree must be real sparse double.");
+    const mxArray* freeMx=requireField(H,"coarseFreeDOFIds");
+    C.h_freeIdsOwned=readIndexVector(freeMx,INT_MAX,false,"H.coarseFreeDOFIds");
+    if (C.h_freeIdsOwned.empty()) throw std::runtime_error("coarseFreeDOFIds cannot be empty.");
+    C.numCoarseFreeDOFs=int(C.h_freeIdsOwned.size());
+    if (mxGetM(A)!=mwSize(C.numCoarseFreeDOFs) || mxGetN(A)!=mwSize(C.numCoarseFreeDOFs))
+        throw std::runtime_error("coarseKFree must be numCoarseFreeDOFs-square.");
+    const Level& coarse0=Gs[0].levels.back();
+    int maxGlobalCoarse=0;
+    for (const auto& G: Gs)
+        for (int32_t id: G.levels.back().globalNodeIds)
+            maxGlobalCoarse=std::max(maxGlobalCoarse,int(id));
+    if (maxGlobalCoarse<=0 || maxGlobalCoarse>INT_MAX/3)
+        throw std::runtime_error("Invalid global coarse node count.");
+    C.globalNumDOFs=3*maxGlobalCoarse;
+    validateOneBasedIds(C.h_freeIdsOwned.data(),C.h_freeIdsOwned.size(),
+                        C.globalNumDOFs,false,"coarseFreeDOFIds");
+    const mwIndex* jc=mxGetJc(A);
+    const mwIndex* ir=mxGetIr(A);
+    const mwIndex nnz=jc[mxGetN(A)];
+    if (nnz>mwIndex(INT_MAX)) throw std::runtime_error("coarseKFree nnz exceeds int32 range.");
+    C.coarseNNZ=int(nnz);
+    C.h_rowOffsetsOwned.resize(C.numCoarseFreeDOFs+1);
+    C.h_colIndicesOwned.resize(nnz);
+    for (int i=0;i<=C.numCoarseFreeDOFs;++i) C.h_rowOffsetsOwned[i]=int32_t(jc[i]);
+    for (mwIndex i=0;i<nnz;++i) C.h_colIndicesOwned[i]=int32_t(ir[i]);
+    C.h_coarseRowPtr=C.h_rowOffsetsOwned.data();
+    C.h_coarseColInd=C.h_colIndicesOwned.data();
+    C.h_coarseValues=static_cast<const double*>(mxGetData(A));
+    C.localNodeCounts.resize(ng);
+    for (int g=0;g<ng;++g) C.localNodeCounts[g]=Gs[g].levels.back().numNodes;
 }
 
-static void initializeCoarseSolver(
-    SolverContext& solver);
-
-static void initializeGPU(
-    SolverContext& solver)
+static void initializeCoarseSolver(GlobalCoarseSolve& C)
 {
     CUDA_CHECK(cudaSetDevice(0));
-    CUDA_CHECK(cudaFree(0));
-
-    size_t freeMemory = 0;
-    size_t totalMemory = 0;
-
-    CUDA_CHECK(cudaMemGetInfo(&freeMemory, &totalMemory));
-
-    if (solver.size > freeMemory)
-    {
-        char message[512];
-        std::snprintf(
-            message,
-            sizeof(message),
-            "The CUDA device has %zu bytes free, but the explicit MGPCG workspace requires %zu bytes. cuDSS will also allocate internal memory.",
-            freeMemory,
-            solver.size);
-        throw std::runtime_error(message);
-    }
-
-    CUDA_CHECK(cudaMalloc(&solver.d_workspace,solver.size));
-
-    char* dW = static_cast<char*>(solver.d_workspace);
-    size_t offset = 0;
-
-    auto takeDouble = [&](size_t count) -> double*
-        {
-            const size_t bytes = checkedMultiply(count, sizeof(double));
-
-            if (offset > solver.size || bytes > solver.size - offset)
-            {
-                throw std::runtime_error("Double workspace layout exceeds the allocated buffer.");
-            }
-
-            double* pointer = reinterpret_cast<double*>(dW + offset);
-            offset += bytes;
-            return pointer;
-        };
-
-    auto takeInt32 = [&](size_t count) -> int32_t*
-        {
-            const size_t bytes = checkedMultiply(count, sizeof(int32_t));
-
-            if (offset > solver.size || bytes > solver.size - offset)
-            {
-                throw std::runtime_error("Integer workspace layout exceeds the allocated buffer.");
-            }
-
-            int32_t* pointer = reinterpret_cast<int32_t*>(dW + offset);
-            offset += bytes;
-            return pointer;
-        };
-
-    // All double arrays.
-    solver.levels[0].d_eleModulus = takeDouble(static_cast<size_t>(solver.levels[0].numElements));
-
-    for (int levelIndex = 0;levelIndex < solver.numLevels - 1;++levelIndex)
-    {
-        solver.levels[levelIndex].d_dK = takeDouble(static_cast<size_t>(solver.levels[levelIndex].numDOFs));
-    }
-
-    const size_t finestDOFs = static_cast<size_t>(solver.levels[0].numDOFs);
-
-    solver.d_y = takeDouble(finestDOFs);
-    solver.d_r = takeDouble(finestDOFs);
-    solver.d_p = takeDouble(finestDOFs);
-    solver.d_Ap = takeDouble(finestDOFs);
-
-    solver.d_coarseRhsFree = takeDouble(static_cast<size_t>(solver.numCoarseFreeDOFs));
-    solver.d_coarseXFree = takeDouble(static_cast<size_t>(solver.numCoarseFreeDOFs));
-    solver.d_coarseValues = takeDouble(static_cast<size_t>(solver.coarseNNZ));
-
-    // Finest MG workspace aliases existing PCG vectors.
-    solver.levels[0].d_rhs = solver.d_r;
-    solver.levels[0].d_x = solver.d_Ap;
-    solver.levels[0].d_rTilde = nullptr;
-
-    // Allocate separate MG rhs/x only for coarse levels.
-    for (int levelIndex = 1; levelIndex < solver.numLevels; ++levelIndex)
-    {
-        Level& level = solver.levels[levelIndex];
-
-        level.d_rhs = takeDouble(static_cast<size_t>(level.numDOFs));
-        level.d_x = takeDouble(static_cast<size_t>(level.numDOFs));
-        level.d_rTilde = nullptr;
-    }
-
-    // All integer arrays.
-    Level& finest = solver.levels[0];
-    finest.d_nodeToElements = takeInt32(static_cast<size_t>(finest.numNodes) * 8);
-    finest.d_eNodMat = takeInt32(static_cast<size_t>(finest.numElements) * 8);
-    for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
-    {
-        Level& level = solver.levels[levelIndex];
-
-        level.d_nodGridId = takeInt32(static_cast<size_t>(level.numNodes));
-        level.d_nodMapForward = takeInt32(level.numGridNodes);
-    }
-
-    solver.d_fixedDOFIds = takeInt32(static_cast<size_t>(solver.numFixedDOFs));
-    solver.d_coarseFreeDOFIds = takeInt32(static_cast<size_t>(solver.numCoarseFreeDOFs));
-    solver.d_coarseRowOffsets = takeInt32(static_cast<size_t>(solver.numCoarseFreeDOFs) + 1);
-    solver.d_coarseColIndices = takeInt32(static_cast<size_t>(solver.coarseNNZ));
-
-    if (offset != solver.size)
-    {
-        throw std::runtime_error("Internal GPU workspace byte count does not match the allocated size.");
-    }
-    CUDA_CHECK(
-        cudaMemcpy(finest.d_eNodMat, finest.h_eNodMat,
-            static_cast<size_t>(finest.numElements) * 8 * sizeof(int32_t),
-            cudaMemcpyHostToDevice));
-    CUDA_CHECK(
-        cudaMemcpy(finest.d_nodeToElements, finest.h_nodeToElements,
-            static_cast<size_t>(finest.numNodes) * 8 * sizeof(int32_t),
-            cudaMemcpyHostToDevice));
-    for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
-    {
-        Level& level = solver.levels[levelIndex];
-
-        CUDA_CHECK(
-            cudaMemcpy(level.d_nodGridId, level.h_nodGridId,
-                static_cast<size_t>(level.numNodes) * sizeof(int32_t),
-                cudaMemcpyHostToDevice));
-
-        CUDA_CHECK(
-            cudaMemcpy(level.d_nodMapForward, level.h_nodMapForward,
-                level.numGridNodes * sizeof(int32_t),
-                cudaMemcpyHostToDevice));
-
-        if (levelIndex == 0)
-        {
-            CUDA_CHECK(
-                cudaMemcpy(level.d_eleModulus, level.h_eleModulus,
-                    static_cast<size_t>(level.numElements) * sizeof(double),
-                    cudaMemcpyHostToDevice));
-        }
-
-        if (levelIndex < solver.numLevels - 1)
-        {
-            CUDA_CHECK(
-                cudaMemcpy(level.d_dK, level.h_dK,
-                    static_cast<size_t>(level.numDOFs) * sizeof(double),
-                    cudaMemcpyHostToDevice));
-        }
-
-        CUDA_CHECK(
-            cudaMemset(
-                level.d_rhs, 0,
-                static_cast<size_t>(level.numDOFs) * sizeof(double)));
-        CUDA_CHECK(
-            cudaMemset(level.d_x, 0,
-                static_cast<size_t>(level.numDOFs) * sizeof(double)));
-
-    }
-
-    if (solver.numFixedDOFs > 0)
-    {
-        CUDA_CHECK(
-            cudaMemcpy(solver.d_fixedDOFIds, solver.h_fixedDOFIds,
-                static_cast<size_t>(solver.numFixedDOFs) * sizeof(int32_t),
-                cudaMemcpyHostToDevice));
-    }
-
-    CUDA_CHECK(
-        cudaMemcpy(solver.d_coarseFreeDOFIds, solver.h_coarseFreeDOFIds,
-            static_cast<size_t>(solver.numCoarseFreeDOFs) * sizeof(int32_t),
-            cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(
-        cudaMemcpy(solver.d_coarseRowOffsets, solver.h_coarseRowOffsets.data(),
-            (static_cast<size_t>(solver.numCoarseFreeDOFs) + 1) * sizeof(int32_t),
-            cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(
-        cudaMemcpy(solver.d_coarseColIndices, solver.h_coarseColIndices.data(),
-            static_cast<size_t>(solver.coarseNNZ) * sizeof(int32_t),
-            cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(
-        cudaMemcpy(solver.d_coarseValues, solver.h_coarseValues,
-            static_cast<size_t>(solver.coarseNNZ) * sizeof(double),
-            cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(
-        cudaMemcpy(
-            solver.d_y,
-            solver.h_y,
-            finestDOFs * sizeof(double),
-            cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(cudaMemcpy(
-        solver.d_r,
-        solver.h_b,
-        finestDOFs * sizeof(double),
-        cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(
-        cudaMemset(
-            solver.d_p,
-            0,
-            finestDOFs * sizeof(double)));
-    CUDA_CHECK(
-        cudaMemset(
-            solver.d_Ap,
-            0,
-            finestDOFs * sizeof(double)));
-    CUDA_CHECK(
-        cudaMemset(
-            solver.d_coarseRhsFree,
-            0,
-            static_cast<size_t>(
-                solver.numCoarseFreeDOFs) *
-                sizeof(double)));
-    CUDA_CHECK(
-        cudaMemset(
-            solver.d_coarseXFree,
-            0,
-            static_cast<size_t>(
-                solver.numCoarseFreeDOFs) *
-                sizeof(double)));
-
-    CUDA_CHECK(
-        cudaMemcpyToSymbol(
-            c_Ke,
-            solver.h_Ke,
-            24 * 24 * sizeof(double)));
-
-    CUBLAS_CHECK(
-        cublasCreate(
-            &solver.cublasHandle));
-    CUBLAS_CHECK(
-        cublasSetPointerMode(
-            solver.cublasHandle,
-            CUBLAS_POINTER_MODE_HOST));
-
-    initializeCoarseSolver(solver);
-
-    solver.initialized = true;
-
-    MEX_PRINT(
-        "MGPCG explicit GPU workspace: %.3f GiB (device free before cuDSS internals: %.3f GiB)",
-        static_cast<double>(solver.size) /
-            (1024.0 * 1024.0 * 1024.0),
-        static_cast<double>(freeMemory) /
-            (1024.0 * 1024.0 * 1024.0));
-}
-
-static void initializeCoarseSolver(
-    SolverContext& solver)
-{
-    const int64_t n =
-        static_cast<int64_t>(
-            solver.numCoarseFreeDOFs);
-
-    CUDSS_CHECK(
-        cudssCreate(
-            &solver.cudssHandle));
-    CUDSS_CHECK(
-        cudssSetStream(
-            solver.cudssHandle,
-            static_cast<cudaStream_t>(0)));
-    CUDSS_CHECK(
-        cudssConfigCreate(
-            &solver.cudssConfig));
-    CUDSS_CHECK(
-        cudssDataCreate(
-            solver.cudssHandle,
-            &solver.cudssData));
-
-    CUDSS_CHECK(
-        cudssMatrixCreateCsr(
-            &solver.cudssA,
-            n,
-            n,
-            solver.coarseNNZ,
-            solver.d_coarseRowOffsets,
-            nullptr,
-            solver.d_coarseColIndices,
-            solver.d_coarseValues,
-            CUDSS_R_32I,
-            CUDSS_R_32I,
-            CUDSS_R_64F,
-            CUDSS_MTYPE_SPD,
-            CUDSS_MVIEW_LOWER,
-            CUDSS_BASE_ZERO));
-
-    CUDSS_CHECK(
-        cudssMatrixCreateDn(
-            &solver.cudssB,
-            n,
-            1,
-            n,
-            solver.d_coarseRhsFree,
-            CUDSS_R_64F,
-            CUDSS_LAYOUT_COL_MAJOR));
-
-    CUDSS_CHECK(
-        cudssMatrixCreateDn(
-            &solver.cudssX,
-            n,
-            1,
-            n,
-            solver.d_coarseXFree,
-            CUDSS_R_64F,
-            CUDSS_LAYOUT_COL_MAJOR));
-
-    CUDSS_CHECK(
-        cudssExecute(
-            solver.cudssHandle,
-            CUDSS_PHASE_ANALYSIS,
-            solver.cudssConfig,
-            solver.cudssData,
-            solver.cudssA,
-            solver.cudssX,
-            solver.cudssB));
-
-    CUDSS_CHECK(
-        cudssExecute(
-            solver.cudssHandle,
-            CUDSS_PHASE_FACTORIZATION,
-            solver.cudssConfig,
-            solver.cudssData,
-            solver.cudssA,
-            solver.cudssX,
-            solver.cudssB));
-
-    // Factorization can be asynchronous. Synchronize before reading INFO.
+    const int64_t n=C.numCoarseFreeDOFs;
+    CUDSS_CHECK(cudssCreate(&C.cudssHandle));
+    CUDSS_CHECK(cudssSetStream(C.cudssHandle, static_cast<cudaStream_t>(0)));
+    CUDSS_CHECK(cudssConfigCreate(&C.cudssConfig));
+    CUDSS_CHECK(cudssDataCreate(C.cudssHandle,&C.cudssData));
+    CUDSS_CHECK(cudssMatrixCreateCsr(&C.cudssA,n,n,C.coarseNNZ,
+        C.d_coarseRowPtr,nullptr,C.d_coarseColInd,C.d_coarseValues,
+        CUDSS_R_32I,CUDSS_R_32I,CUDSS_R_64F,
+        CUDSS_MTYPE_SPD,CUDSS_MVIEW_LOWER,CUDSS_BASE_ZERO));
+    CUDSS_CHECK(cudssMatrixCreateDn(&C.cudssB,n,1,n,C.d_coarseRhsFree,
+                                    CUDSS_R_64F,CUDSS_LAYOUT_COL_MAJOR));
+    CUDSS_CHECK(cudssMatrixCreateDn(&C.cudssX,n,1,n,C.d_coarseXFree,
+                                    CUDSS_R_64F,CUDSS_LAYOUT_COL_MAJOR));
+    CUDSS_CHECK(cudssExecute(C.cudssHandle,CUDSS_PHASE_ANALYSIS,
+                             C.cudssConfig,C.cudssData,C.cudssA,C.cudssX,C.cudssB));
+    CUDSS_CHECK(cudssExecute(C.cudssHandle,CUDSS_PHASE_FACTORIZATION,
+                             C.cudssConfig,C.cudssData,C.cudssA,C.cudssX,C.cudssB));
     CUDA_CHECK(cudaDeviceSynchronize());
-
-    int info = 0;
-    size_t sizeWritten = 0;
-
-    CUDSS_CHECK(
-        cudssDataGet(
-            solver.cudssHandle,
-            solver.cudssData,
-            CUDSS_DATA_INFO,
-            &info,
-            sizeof(info),
-            &sizeWritten));
-
-    if (sizeWritten != sizeof(info))
-    {
-        throw std::runtime_error(
-            "cuDSS returned an unexpected CUDSS_DATA_INFO size.");
-    }
-
-    if (info != 0)
-    {
-        char message[512];
-        std::snprintf(
-            message,
-            sizeof(message),
-            "cuDSS coarse Cholesky factorization failed at reordered 1-based minor %d.",
-            info);
-        throw std::runtime_error(message);
-    }
+    int info=0; size_t sizeWritten=0;
+    CUDSS_CHECK(cudssDataGet(C.cudssHandle,C.cudssData,CUDSS_DATA_INFO,
+                             &info,sizeof(info),&sizeWritten));
+    if (sizeWritten!=sizeof(info) || info!=0)
+        throw std::runtime_error("cuDSS coarse factorization failed (INFO="+std::to_string(info)+").");
+    C.initialized=true;
 }
 
-static void zeroFixedDOFs(
+static void initializeGPUs(std::vector<singleGPUData>& Gs, GlobalCoarseSolve& C)
+{
+    for (singleGPUData& G : Gs) {
+        CUDA_CHECK(cudaSetDevice(G.deviceId));
+        CUDA_CHECK(cudaFree(0));
+        size_t freeMem=0,totalMem=0;
+        CUDA_CHECK(cudaMemGetInfo(&freeMem,&totalMem));
+        if (G.size>freeMem)
+            throw std::runtime_error("GPU "+std::to_string(G.deviceId)+" insufficient memory for workspace.");
+        CUDA_CHECK(cudaMalloc(&G.d_workspace,G.size));
+        char* base=static_cast<char*>(G.d_workspace);
+        size_t offset=0;
+        auto takeD = [&](size_t n)->double* {
+            const size_t bytes=checkedMultiply(n,sizeof(double));
+            if (offset>G.size || bytes>G.size-offset) throw std::runtime_error("Double workspace overflow.");
+            double* p=reinterpret_cast<double*>(base+offset);offset+=bytes;return p;
+        };
+        auto takeI = [&](size_t n)->int32_t* {
+            const size_t bytes=checkedMultiply(n,sizeof(int32_t));
+            if (offset>G.size || bytes>G.size-offset) throw std::runtime_error("Int32 workspace overflow.");
+            int32_t* p=reinterpret_cast<int32_t*>(base+offset);offset+=bytes;return p;
+        };
+        auto takeB = [&](size_t n)->uint8_t* {
+            if (offset>G.size || n>G.size-offset) throw std::runtime_error("Mask workspace overflow.");
+            uint8_t* p=reinterpret_cast<uint8_t*>(base+offset);offset+=n;return p;
+        };
+        Level& fine=G.levels.front();
+        fine.d_eleModulus=takeD(fine.numElements);
+        for (int l=0;l+1<G.numLevels;++l) G.levels[l].d_dK=takeD(G.levels[l].numDOFs);
+        G.d_y=takeD(fine.numDOFs); G.d_r=takeD(fine.numDOFs);
+        G.d_p=takeD(fine.numDOFs); G.d_Ap=takeD(fine.numDOFs);
+        fine.d_rhs=G.d_r; fine.d_x=G.d_Ap;
+        for (int l=1;l<G.numLevels;++l) {
+            G.levels[l].d_rhs=takeD(G.levels[l].numDOFs);
+            G.levels[l].d_x=takeD(G.levels[l].numDOFs);
+        }
+        G.d_dotPartials=takeD(G.partialCount); G.d_dotScalar=takeD(1);
+        for (Level& L : G.levels)
+            for (HaloSide* side : {&L.left,&L.right})
+                if (!side->sendLocal.empty()) side->d_sendBuffer=takeD(3*side->sendLocal.size());
+        for (InterfaceSide* side : {&fine.leftInterface,&fine.rightInterface}) {
+            if (!side->sendLocal.empty()) side->d_sendBuffer=takeD(3*side->sendLocal.size());
+            if (side->recvCount) side->d_recvBuffer=takeD(3*size_t(side->recvCount));
+        }
+        fine.d_nodeToElements=takeI(8*size_t(fine.numNodes));
+        fine.d_eNodMat=takeI(8*size_t(fine.numElements));
+        for (Level& L : G.levels) {
+            L.d_nodGridId=takeI(L.numNodes);
+            L.d_nodMapForward=takeI(L.numGridNodes);
+        }
+        if (G.numFixedDOFs) G.d_fixedDOFIds=takeI(G.numFixedDOFs);
+        for (Level& L : G.levels)
+            for (HaloSide* side : {&L.left,&L.right})
+                if (!side->sendLocal.empty()) side->d_sendLocal=takeI(side->sendLocal.size());
+        for (InterfaceSide* side : {&fine.leftInterface,&fine.rightInterface}) {
+            if (!side->sendLocal.empty()) side->d_sendLocal=takeI(side->sendLocal.size());
+            if (side->recvCount) side->d_recvLocal=takeI(side->recvCount);
+        }
+        for (Level& L:G.levels) L.d_ownedNodeMask=takeB(L.numNodes);
+        if (offset!=G.size) throw std::runtime_error("GPU workspace size/layout mismatch.");
+        auto copy = [](void* dst,const void* src,size_t n) {
+            if (n) CUDA_CHECK(cudaMemcpy(dst,src,n,cudaMemcpyHostToDevice));
+        };
+        copy(fine.d_nodeToElements,fine.h_nodeToElements,8*size_t(fine.numNodes)*sizeof(int32_t));
+        copy(fine.d_eNodMat,fine.h_eNodMat,8*size_t(fine.numElements)*sizeof(int32_t));
+        copy(fine.d_eleModulus,fine.h_eleModulus,size_t(fine.numElements)*sizeof(double));
+        for (int l=0;l<G.numLevels;++l) {
+            Level& L=G.levels[l];
+            copy(L.d_nodGridId,L.h_nodGridId,size_t(L.numNodes)*sizeof(int32_t));
+            copy(L.d_nodMapForward,L.h_nodMapForward,L.numGridNodes*sizeof(int32_t));
+            copy(L.d_ownedNodeMask,L.h_ownedNodeMask,size_t(L.numNodes));
+            if (l+1<G.numLevels)
+                copy(L.d_dK,L.h_dK,size_t(L.numDOFs)*sizeof(double));
+            for (HaloSide* side : {&L.left,&L.right})
+                copy(side->d_sendLocal,side->sendLocal.data(),side->sendLocal.size()*sizeof(int32_t));
+            CUDA_CHECK(cudaMemset(L.d_x,0,size_t(L.numDOFs)*sizeof(double)));
+            if (l>0) CUDA_CHECK(cudaMemset(L.d_rhs,0,size_t(L.numDOFs)*sizeof(double)));
+        }
+        for (InterfaceSide* side : {&fine.leftInterface,&fine.rightInterface}) {
+            copy(side->d_sendLocal,side->sendLocal.data(),side->sendLocal.size()*sizeof(int32_t));
+            copy(side->d_recvLocal,side->recvLocal.data(),side->recvLocal.size()*sizeof(int32_t));
+        }
+        copy(G.d_fixedDOFIds,G.h_fixedDOFIds,size_t(G.numFixedDOFs)*sizeof(int32_t));
+        copy(G.d_y,G.h_y,size_t(fine.numDOFs)*sizeof(double));
+        copy(G.d_r,G.h_b,size_t(fine.numDOFs)*sizeof(double));
+        CUDA_CHECK(cudaMemset(G.d_p,0,size_t(fine.numDOFs)*sizeof(double)));
+        CUDA_CHECK(cudaMemcpyToSymbol(c_Ke,G.h_Ke,24*24*sizeof(double)));
+        CUBLAS_CHECK(cublasCreate(&G.cublasHandle));
+        CUBLAS_CHECK(cublasSetPointerMode(G.cublasHandle,CUBLAS_POINTER_MODE_HOST));
+        G.initialized=true;
+    }
+    CUDA_CHECK(cudaSetDevice(0));
+    auto alloc = [](auto& ptr,size_t bytes) {
+        if (bytes) CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ptr),bytes));
+    };
+    auto put = [](void* dst,const void* src,size_t bytes) {
+        if (bytes) CUDA_CHECK(cudaMemcpy(dst,src,bytes,cudaMemcpyHostToDevice));
+    };
+    alloc(C.d_globalRHS,size_t(C.globalNumDOFs)*sizeof(double));
+    alloc(C.d_globalX,size_t(C.globalNumDOFs)*sizeof(double));
+    alloc(C.d_coarseRhsFree,size_t(C.numCoarseFreeDOFs)*sizeof(double));
+    alloc(C.d_coarseXFree,size_t(C.numCoarseFreeDOFs)*sizeof(double));
+    alloc(C.d_coarseFreeDOFIds,size_t(C.numCoarseFreeDOFs)*sizeof(int32_t));
+    alloc(C.d_coarseRowPtr,size_t(C.numCoarseFreeDOFs+1)*sizeof(int32_t));
+    alloc(C.d_coarseColInd,size_t(C.coarseNNZ)*sizeof(int32_t));
+    alloc(C.d_coarseValues,size_t(C.coarseNNZ)*sizeof(double));
+    put(C.d_coarseFreeDOFIds,C.h_freeIdsOwned.data(),size_t(C.numCoarseFreeDOFs)*sizeof(int32_t));
+    put(C.d_coarseRowPtr,C.h_coarseRowPtr,size_t(C.numCoarseFreeDOFs+1)*sizeof(int32_t));
+    put(C.d_coarseColInd,C.h_coarseColInd,size_t(C.coarseNNZ)*sizeof(int32_t));
+    put(C.d_coarseValues,C.h_coarseValues,size_t(C.coarseNNZ)*sizeof(double));
+    const size_t ng=Gs.size();
+    C.d_recvResidual.resize(ng,nullptr);C.d_sendResidual.resize(ng,nullptr);
+    C.d_globalNodeIds.resize(ng,nullptr);C.d_ownedMasks.resize(ng,nullptr);
+    for (size_t g=0;g<ng;++g) {
+        const Level& L=Gs[g].levels.back();
+        const size_t n=L.numNodes;
+        alloc(C.d_recvResidual[g],3*n*sizeof(double));
+        alloc(C.d_sendResidual[g],3*n*sizeof(double));
+        alloc(C.d_globalNodeIds[g],n*sizeof(int32_t));
+        alloc(C.d_ownedMasks[g],n*sizeof(uint8_t));
+        put(C.d_globalNodeIds[g],L.h_globalNodeIds,n*sizeof(int32_t));
+        put(C.d_ownedMasks[g],L.h_ownedNodeMask,n*sizeof(uint8_t));
+    }
+    initializeCoarseSolver(C);
+}
+
+static void zeroFixedDOFs(singleGPUData& G, double* d_vector)
+{
+    if (G.numFixedDOFs == 0) return;
+    zeroSelectedDOFsKernel<<<gridSizeFor(G.numFixedDOFs, 256), 256>>>(
+        d_vector, G.d_fixedDOFIds, G.numFixedDOFs);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void reduceOwnedPartialsKernel(const double* partials, int count, double* result)
+{
+    extern __shared__ double scratch[];
+    const int tid = threadIdx.x;
+    double x = 0.0;
+    for (int i = tid; i < count; i += blockDim.x) x += partials[i];
+    scratch[tid] = x;
+    __syncthreads();
+    for (int step = blockDim.x / 2; step; step >>= 1) {
+        if (tid < step) scratch[tid] += scratch[tid + step];
+        __syncthreads();
+    }
+    if (tid == 0) *result = scratch[0];
+}
+
+static double globalDotProduct(singleGPUData& G, ncclComm_t comm,
+                               cudaStream_t ncclStream,
+                               const double* d_a, const double* d_b)
+{
+    CUDA_CHECK(cudaSetDevice(G.deviceId));
+    const Level& fine = G.levels[0];
+    ownedDotPartialKernel<<<G.partialCount, 256, 256 * sizeof(double)>>>(
+        d_a, d_b, fine.d_ownedNodeMask, G.d_dotPartials, fine.numNodes);
+    CUDA_CHECK(cudaGetLastError());
+    reduceOwnedPartialsKernel<<<1, 256, 256 * sizeof(double)>>>(
+        G.d_dotPartials, G.partialCount, G.d_dotScalar);
+    CUDA_CHECK(cudaGetLastError());
+    // The collective stream is non-blocking; establish dependency explicitly.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    NCCL_CHECK(ncclAllReduce(G.d_dotScalar, G.d_dotScalar, 1, ncclDouble,
+                            ncclSum, comm, ncclStream));
+    double answer = 0.0;
+    CUDA_CHECK(cudaMemcpyAsync(&answer, G.d_dotScalar, sizeof(double),
+                               cudaMemcpyDeviceToHost, ncclStream));
+    CUDA_CHECK(cudaStreamSynchronize(ncclStream));
+    return answer;
+}
+
+static void globalNorm(double& norm, singleGPUData& G, ncclComm_t comm,
+                       cudaStream_t ncclStream, const double* d_r)
+{
+    const double square = globalDotProduct(G, comm, ncclStream, d_r, d_r);
+    if (!std::isfinite(square) || square < -1e-12)
+        throw std::runtime_error("Invalid global squared residual norm.");
+    norm = std::sqrt(std::max(0.0, square));
+}
+
+static void solveCoarsest(coarsestLevelData& C, const double* d_rhs, double* d_x)
+{
+    constexpr int block = 256;
+    const int n = C.numCoarseFreeDOFs;
+    CUDA_CHECK(cudaMemset(d_x, 0, size_t(C.globalNumDOFs) * sizeof(double)));
+    CUDA_CHECK(cudaMemset(C.d_coarseXFree, 0, size_t(n) * sizeof(double)));
+    gatherSelectedDOFsKernel<<<gridSizeFor(n, block), block>>>(
+        d_rhs, C.d_coarseFreeDOFIds, C.d_coarseRhsFree, n);
+    CUDA_CHECK(cudaGetLastError());
+    CUDSS_CHECK(cudssExecute(C.cudssHandle, CUDSS_PHASE_SOLVE,
+                             C.cudssConfig, C.cudssData, C.cudssA, C.cudssX, C.cudssB));
+    scatterSelectedDOFsKernel<<<gridSizeFor(n, block), block>>>(
+        C.d_coarseXFree, C.d_coarseFreeDOFIds, d_x, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void destroySolver(coarsestLevelData& C) noexcept
+{
+    if (cudaSetDevice(0) != cudaSuccess) return;
+    if (C.cudssA) { (void)cudssMatrixDestroy(C.cudssA); C.cudssA = nullptr; }
+    if (C.cudssX) { (void)cudssMatrixDestroy(C.cudssX); C.cudssX = nullptr; }
+    if (C.cudssB) { (void)cudssMatrixDestroy(C.cudssB); C.cudssB = nullptr; }
+    if (C.cudssData && C.cudssHandle)
+        (void)cudssDataDestroy(C.cudssHandle, C.cudssData);
+    C.cudssData = nullptr;
+    if (C.cudssConfig) (void)cudssConfigDestroy(C.cudssConfig);
+    C.cudssConfig = nullptr;
+    if (C.cudssHandle) (void)cudssDestroy(C.cudssHandle);
+    C.cudssHandle = nullptr;
+    auto freeP = [](void*& p) { if (p) (void)cudaFree(p); p = nullptr; };
+    freeP(reinterpret_cast<void*&>(C.d_coarseRowPtr));
+    freeP(reinterpret_cast<void*&>(C.d_coarseColInd));
+    freeP(reinterpret_cast<void*&>(C.d_coarseValues));
+    freeP(reinterpret_cast<void*&>(C.d_coarseRhsFree));
+    freeP(reinterpret_cast<void*&>(C.d_coarseXFree));
+    freeP(reinterpret_cast<void*&>(C.d_coarseFreeDOFIds));
+    freeP(reinterpret_cast<void*&>(C.d_globalRHS));
+    freeP(reinterpret_cast<void*&>(C.d_globalX));
+    for (auto& p : C.d_recvResidual) freeP(reinterpret_cast<void*&>(p));
+    for (auto& p : C.d_sendResidual) freeP(reinterpret_cast<void*&>(p));
+    for (auto& p : C.d_globalNodeIds) freeP(reinterpret_cast<void*&>(p));
+    for (auto& p : C.d_ownedMasks) freeP(reinterpret_cast<void*&>(p));
+    C.initialized = false;
+}
+
+static void destroySolver(singleGPUData& G) noexcept
+{
+    if (cudaSetDevice(G.deviceId) != cudaSuccess) return;
+    if (G.cublasHandle) (void)cublasDestroy(G.cublasHandle);
+    G.cublasHandle = nullptr;
+    if (G.d_workspace) (void)cudaFree(G.d_workspace);
+    G.d_workspace = nullptr;
+    G.initialized = false;
+}
+
+
+static void broadcastCoarseSolution(
     singleGPUData& G,
-    double* d_vector)
+    GlobalCoarseSolve& C,
+    const std::vector<ncclComm_t>& comms)
 {
-    if (G.numFixedDOFs == 0)
-        return;
-
+    constexpr int rootGPU = 0;
     constexpr int blockSize = 256;
 
-    const int gridSize =
-        gridSizeFor(G.numFixedDOFs, blockSize);
+    const int rank = G.deviceId;
+    const int lastLevel = G.numLevels - 1;
+    const Level& coarse = G.levels[lastLevel];
 
-    zeroSelectedDOFsKernel<<<gridSize, blockSize>>>(
-        d_vector,
-        G.d_fixedDOFIds,
-        G.numFixedDOFs
-    );
+    const int localDOFs = 3 * coarse.numNodes;
 
-    CUDA_CHECK(cudaGetLastError());
+    // Divide the global coarse solution into each partition's local ordering.
+    if (rank == rootGPU)
+    {
+        for (int g = 0; g < G.numGPUs; ++g)
+        {
+            const int n = C.localNodeCounts[g];
+
+            if (n == 0)
+                continue;
+
+            const int grid = gridSizeFor(n, blockSize);
+
+            scatterGlobalCoarseResidualKernel
+                <<<grid, blockSize, 0>>>(
+                    C.d_sendResidual[g],
+                    C.d_globalX,
+                    C.d_globalNodeIds[g],
+                    n
+                );
+
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(0));
+    // Copy the global RHS into the local coarse RHS for GPU 0.
+    // Broadcast the global coarse solution to all GPUs.
+    if (rank == rootGPU)
+    {
+        // Send GPU 0's local residual.
+        if (localDOFs > 0)
+        {
+            CUDA_CHECK(cudaMemcpyAsync(
+                coarse.d_x,
+                C.d_sendResidual[rootGPU],
+                static_cast<size_t>(localDOFs) * sizeof(double),
+                cudaMemcpyDeviceToDevice,
+                0
+            ));
+        }
+
+        // Send the other partitions' residuals.
+        ScopedNcclGroup group;
+
+        for (int g = 1; g < G.numGPUs; ++g)
+        {
+            // Receiving partition's node count.
+            const int count = 3 * C.localNodeCounts[g];
+
+            if (count == 0)
+                continue;
+
+            NCCL_CHECK(ncclSend(
+                C.d_sendResidual[g],
+                count,
+                ncclDouble,
+                g,
+                comms[rootGPU],
+                0
+            ));
+        }
+
+        group.finish();
+    }
+    else if (localDOFs > 0)
+    {
+        NCCL_CHECK(ncclRecv(
+            coarse.d_x,
+            localDOFs,
+            ncclDouble,
+            rootGPU,
+            comms[rank],
+            0
+        ));
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(0));
+    workerBarrier();
 }
 
-static void solveCoarsest(
-    SolverContext& solver,
-    const double* d_rhs,
-    double* d_x)
+static void assembleGlobalCoarseResidual(
+    singleGPUData& G, GlobalCoarseSolve& C,
+    const std::vector<ncclComm_t>& comms)
 {
+    constexpr int rootGPU = 0;
     constexpr int blockSize = 256;
-    const int n =
-        solver.numCoarseFreeDOFs;
-    const int gridSize =
-        gridSizeFor(
-            n,
-            blockSize);
 
-    CUDA_CHECK(
-        cudaMemset(
-            d_x,
+    const int rank = G.deviceId;
+    const int lastLevel = G.numLevels - 1;
+    const Level& coarse = G.levels[lastLevel];
+
+    const int localDOFs = 3 * coarse.numNodes;
+
+    if (rank == rootGPU)
+    {
+        // Preserve GPU 0's local residual.
+        if (localDOFs > 0)
+        {
+            CUDA_CHECK(cudaMemcpyAsync(
+                C.d_recvResidual[rootGPU],
+                coarse.d_rhs,
+                static_cast<size_t>(localDOFs) * sizeof(double),
+                cudaMemcpyDeviceToDevice,
+                0
+            ));
+        }
+
+        // Receive the other partitions' residuals.
+        ScopedNcclGroup group;
+
+        for (int g = 1; g < G.numGPUs; ++g)
+        {
+            const int count = 3 * C.localNodeCounts[g];
+
+            if (count == 0)
+                continue;
+
+            NCCL_CHECK(ncclRecv(
+                C.d_recvResidual[g],
+                count,
+                ncclDouble,
+                g,
+                comms[rootGPU],
+                0
+            ));
+        }
+
+        group.finish();
+    }
+    else if (localDOFs > 0)
+    {
+        NCCL_CHECK(ncclSend(
+            coarse.d_rhs,
+            localDOFs,
+            ncclDouble,
+            rootGPU,
+            comms[rank],
+            0
+        ));
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(0));
+    workerBarrier();
+
+    if (rank == rootGPU)
+    {
+        // Reset the global RHS.
+        CUDA_CHECK(cudaMemsetAsync(
+            C.d_globalRHS,
             0,
-            static_cast<size_t>(
-                solver.levels.back().numDOFs) *
-                sizeof(double)));
+            static_cast<size_t>(C.globalNumDOFs) * sizeof(double),
+            0
+        ));
 
-    CUDA_CHECK(
-        cudaMemset(
-            solver.d_coarseXFree,
-            0,
-            static_cast<size_t>(n) *
-                sizeof(double)));
+        // Copy each partition into global ordering.
+        for (int g = 0; g < G.numGPUs; ++g)
+        {
+            const int n = C.localNodeCounts[g];
 
-    gatherSelectedDOFsKernel<<<gridSize, blockSize>>>(
-        d_rhs,
-        solver.d_coarseFreeDOFIds,
-        solver.d_coarseRhsFree,
-        n);
-    CUDA_CHECK(cudaGetLastError());
+            if (n == 0)
+                continue;
 
-    CUDSS_CHECK(
-        cudssExecute(
-            solver.cudssHandle,
-            CUDSS_PHASE_SOLVE,
-            solver.cudssConfig,
-            solver.cudssData,
-            solver.cudssA,
-            solver.cudssX,
-            solver.cudssB));
+            const int grid = gridSizeFor(n, blockSize);
 
-    // cuDSS and the kernels below use stream 0, so the scatter is ordered
-    // after the solve without a host synchronization.
-    scatterSelectedDOFsKernel<<<gridSize, blockSize>>>(
-        solver.d_coarseXFree,
-        solver.d_coarseFreeDOFIds,
-        d_x,
-        n);
-    CUDA_CHECK(cudaGetLastError());
+            gatherGlobalCoarseResidualKernel
+                <<<grid, blockSize, 0>>>(
+                    C.d_recvResidual[g],
+                    C.d_globalRHS,
+                    C.d_globalNodeIds[g],
+                    C.d_ownedMasks[g],
+                    n
+                );
+
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        CUDA_CHECK(cudaStreamSynchronize(0));
+    }
+
+    workerBarrier();
 }
 
-static void destroySolver(
-    SolverContext& solver) noexcept
+__global__ void packHaloKernel(const double*, const int32_t*, double*, int);
+static void copyBoundaryToHalo(int, const double*, int, double*, int, cudaStream_t);
+
+static void sendOneSideHalo(int sourceDeviceId, HaloSide& S,
+                            const double* d_src, int neighborDeviceId,
+                            double* d_dstNeighbor, cudaStream_t stream)
 {
-    if (solver.cudssA != nullptr)
-    {
-        (void)cudssMatrixDestroy(
-            solver.cudssA);
-        solver.cudssA = nullptr;
-    }
-
-    if (solver.cudssX != nullptr)
-    {
-        (void)cudssMatrixDestroy(
-            solver.cudssX);
-        solver.cudssX = nullptr;
-    }
-
-    if (solver.cudssB != nullptr)
-    {
-        (void)cudssMatrixDestroy(
-            solver.cudssB);
-        solver.cudssB = nullptr;
-    }
-
-    if (solver.cudssData != nullptr &&
-        solver.cudssHandle != nullptr)
-    {
-        (void)cudssDataDestroy(
-            solver.cudssHandle,
-            solver.cudssData);
-        solver.cudssData = nullptr;
-    }
-
-    if (solver.cudssConfig != nullptr)
-    {
-        (void)cudssConfigDestroy(
-            solver.cudssConfig);
-        solver.cudssConfig = nullptr;
-    }
-
-    if (solver.cudssHandle != nullptr)
-    {
-        (void)cudssDestroy(
-            solver.cudssHandle);
-        solver.cudssHandle = nullptr;
-    }
-
-    if (solver.cublasHandle != nullptr)
-    {
-        (void)cublasDestroy(
-            solver.cublasHandle);
-        solver.cublasHandle = nullptr;
-    }
-
-    if (solver.d_workspace != nullptr)
-    {
-        (void)cudaFree(
-            solver.d_workspace);
-        solver.d_workspace = nullptr;
-    }
-
-    solver.initialized = false;
+    if (S.sendLocal.empty()) return;
+    if (neighborDeviceId < 0 || S.sendLocal.size() != S.sendDestLocal.size())
+        throw std::runtime_error("Halo neighbor/index count mismatch.");
+    // A peer memcpy can target a contiguous slice only; validate at input time too.
+    for (size_t i = 1; i < S.sendDestLocal.size(); ++i)
+        if (S.sendDestLocal[i] != S.sendDestLocal[i-1] + 1)
+            throw std::runtime_error("Halo destination indices must be contiguous.");
+    const int count = static_cast<int>(S.sendLocal.size());
+    packHaloKernel<<<gridSizeFor(count, 256), 256, 0, stream>>>(
+        d_src, S.d_sendLocal, S.d_sendBuffer, count);
+    CUDA_CHECK(cudaGetLastError());
+    const size_t offset = 3 * size_t(S.sendDestLocal[0] - 1);
+    copyBoundaryToHalo(sourceDeviceId, S.d_sendBuffer, neighborDeviceId,
+                       d_dstNeighbor + offset, count, stream);
 }
+
 
 static void applyVcycle(
-    SolverContext& solver,
+    singleGPUData& G,
     const double* d_fineResidual,
-    double* d_fineCorrection)
+    double* d_fineCorrection,
+    std::vector<singleGPUData>& gpuData,
+    StreamData& streams,
+    std::vector<ncclComm_t>& ncclComms,
+    GlobalCoarseSolve& globalCoarse,
+    VcycleShared& scratch)
 {
     constexpr int blockSize = 256;
-    const int lastLevel = solver.numLevels - 1;
-
-    Level& finest = solver.levels[0];
+    const int lastLevel = G.numLevels - 1;
+    Level& finest = G.levels[0];
 
     if (finest.d_rhs != d_fineResidual)
     {
-        CUDA_CHECK(
-            cudaMemcpy(
-                finest.d_rhs,
-                d_fineResidual,
-                static_cast<size_t>(finest.numDOFs) * sizeof(double),
-                cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(
+            finest.d_rhs,
+            d_fineResidual,
+            static_cast<size_t>(finest.numDOFs) * sizeof(double),
+            cudaMemcpyDeviceToDevice));
     }
 
-    for (int levelIndex = 0; levelIndex < solver.numLevels; ++levelIndex)
+    // Exchange finest-level residual halos before the first restriction.
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+    workerBarrier();
+
+    if (finest.right.neighborGPU >= 0)
     {
-        Level& level = solver.levels[levelIndex];
+        const int neighbor = finest.right.neighborGPU;
 
-        CUDA_CHECK(
-            cudaMemset(
-                level.d_x, 0,
-                static_cast<size_t>(level.numDOFs) * sizeof(double)));
+        sendOneSideHalo(
+            G.deviceId,
+            finest.right,
+            finest.d_rhs,
+            neighbor,
+            gpuData[neighbor].levels[0].d_rhs,
+            streams.rightStream
+        );
+    }
 
+    if (finest.left.neighborGPU >= 0)
+    {
+        const int neighbor = finest.left.neighborGPU;
+
+        sendOneSideHalo(
+            G.deviceId,
+            finest.left,
+            finest.d_rhs,
+            neighbor,
+            gpuData[neighbor].levels[0].d_rhs,
+            streams.leftStream
+        );
+    }
+
+    if (finest.right.neighborGPU >= 0)
+        CUDA_CHECK(cudaStreamSynchronize(streams.rightStream));
+
+    if (finest.left.neighborGPU >= 0)
+        CUDA_CHECK(cudaStreamSynchronize(streams.leftStream));
+
+    workerBarrier();
+
+    // Initialize all level corrections.
+    for (int levelIndex = 0; levelIndex < G.numLevels; ++levelIndex)
+    {
+        Level& level = G.levels[levelIndex];
+
+        CUDA_CHECK(cudaMemset(
+            level.d_x,
+            0,
+            static_cast<size_t>(level.numDOFs) * sizeof(double)));
     }
 
     // Restriction
     for (int fineIndex = 0; fineIndex < lastLevel; ++fineIndex)
     {
-        Level& fine = solver.levels[fineIndex];
-        Level& coarse = solver.levels[fineIndex + 1];
+        Level& fine = G.levels[fineIndex];
+        Level& coarse = G.levels[fineIndex + 1];
 
+        // Todo-->why??
         const int smoothGrid = gridSizeFor(fine.numDOFs, blockSize);
 
         if (fineIndex == 0)
@@ -1919,7 +2074,7 @@ static void applyVcycle(
                 fine.d_dK,
                 fine.d_x,
                 fine.d_x,
-                solver.jacobiOmega,
+                G.jacobiOmega,
                 fine.numDOFs);
         }
         else
@@ -1928,7 +2083,7 @@ static void applyVcycle(
                 fine.d_rhs,
                 fine.d_dK,
                 fine.d_x,
-                solver.jacobiOmega,
+                G.jacobiOmega,
                 fine.numDOFs);
         }
         CUDA_CHECK(cudaGetLastError());
@@ -1947,27 +2102,150 @@ static void applyVcycle(
             fine.nx,
             fine.ny,
             fine.nz,
-            solver.spanWidths[fineIndex]);
+            G.spanWidths[fineIndex]);
         CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        workerBarrier();
 
-        // Communicate
+        // Send coarse residual to right GPU.
+        if (coarse.right.neighborGPU >= 0)
+        {
+            const int neighbor = coarse.right.neighborGPU;
+
+            sendOneSideHalo(
+                G.deviceId,
+                coarse.right,
+                coarse.d_rhs,
+                neighbor,
+                gpuData[neighbor].levels[fineIndex + 1].d_rhs,
+                streams.rightStream
+
+            );
+        }
+
+        // Send coarse residual to left GPU.
+        if (coarse.left.neighborGPU >= 0)
+        {
+            const int neighbor = coarse.left.neighborGPU;
+
+            sendOneSideHalo(
+                G.deviceId,
+                coarse.left,
+                coarse.d_rhs,
+                neighbor,
+                gpuData[neighbor].levels[fineIndex + 1].d_rhs,
+                streams.leftStream
+            );
+        }
+
+        // Wait for both outgoing transfers.
+        if (coarse.right.neighborGPU >= 0)
+        {
+            CUDA_CHECK(cudaStreamSynchronize(streams.rightStream));
+        }
+
+        if (coarse.left.neighborGPU >= 0)
+        {
+            CUDA_CHECK(cudaStreamSynchronize(streams.leftStream));
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        workerBarrier();
+
     }
-    nvtxRangePushA("MGPCG:solveCoarsest");
-    // Solve the coarsest level system with cuDSS.
-    solveCoarsest(solver, solver.levels[lastLevel].d_rhs, solver.levels[lastLevel].d_x);
-    nvtxRangePop();
+    // Assemble global coarse residual into global coarse residual on GPU 0.
+    // All GPUs participate.
+    assembleGlobalCoarseResidual(
+        G, globalCoarse,
+        ncclComms
+    );
+    // Solve the coarsest level on GPU 0 only.
+    if (G.deviceId == 0)
+    {
+        solveCoarsest(
+            globalCoarse,
+            globalCoarse.d_globalRHS,
+            globalCoarse.d_globalX
+        );
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    // All OpenMP threads wait here.
+    workerBarrier();
+
+    // Broadcast the coarse solution from GPU 0 to other GPUs.
+    // Ensure the broadcast is complete before interpolation.
+    broadcastCoarseSolution(
+        G,
+        globalCoarse,
+        ncclComms
+    );
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+    workerBarrier();
+
     // Interpolation and post-smoothing
     for (int coarseIndex = lastLevel; coarseIndex >= 1; --coarseIndex)
     {
         const int fineIndex = coarseIndex - 1;
 
-        Level& fine = solver.levels[fineIndex];
-        Level& coarse = solver.levels[coarseIndex];
+        Level& fine = G.levels[fineIndex];
+        Level& coarse = G.levels[coarseIndex];
+
+        // Ensure the coarse correction is ready.
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // ----------------------------------------
+        // Exchange coarse correction halos
+        // ----------------------------------------
+
+        if (coarse.right.neighborGPU >= 0)
+        {
+            const int neighbor = coarse.right.neighborGPU;
+
+            sendOneSideHalo(
+                G.deviceId,
+                coarse.right,
+                coarse.d_x,
+                neighbor,
+                gpuData[neighbor].levels[coarseIndex].d_x,
+                streams.rightStream
+            );
+        }
+
+        if (coarse.left.neighborGPU >= 0)
+        {
+            const int neighbor = coarse.left.neighborGPU;
+
+            sendOneSideHalo(
+                G.deviceId,
+                coarse.left,
+                coarse.d_x,
+                neighbor,
+                gpuData[neighbor].levels[coarseIndex].d_x,
+                streams.leftStream
+            );
+        }
+
+        if (coarse.right.neighborGPU >= 0)
+        {
+            CUDA_CHECK(cudaStreamSynchronize(
+                streams.rightStream));
+        }
+
+        if (coarse.left.neighborGPU >= 0)
+        {
+            CUDA_CHECK(cudaStreamSynchronize(
+                streams.leftStream));
+        }
+
+        // All GPUs have finished sending halo data.
+        workerBarrier();
+
+        // ----------------------------------------
+        // Interpolation: fine.d_x += P * coarse.d_x
+        // ----------------------------------------
 
         const int interpolationGrid = gridSizeFor(fine.numNodes, blockSize);
 
-        // fine.d_temp = P * coarse.d_x
-        // Add interpolated coarse correction directly into the existing fine solution.
         interpolateResidualKernel<<<interpolationGrid, blockSize>>>(
             fine.d_nodGridId,
             coarse.d_nodMapForward,
@@ -1980,36 +2258,44 @@ static void applyVcycle(
             fine.nx,
             fine.ny,
             fine.nz,
-            solver.spanWidths[fineIndex]);
+            G.spanWidths[fineIndex]
+        );
 
         CUDA_CHECK(cudaGetLastError());
 
-        const int dofGrid =
-            gridSizeFor(fine.numDOFs, blockSize);
+        // ----------------------------------------
+        // Post-smoothing
+        // ----------------------------------------
 
-        // Second additive Jacobi term.
+        const int dofGrid = gridSizeFor(fine.numDOFs, blockSize);
+
         addDampedJacobiKernel<<<dofGrid, blockSize>>>(
             fine.d_rhs,
             fine.d_dK,
             fine.d_x,
-            solver.jacobiOmega,
-            fine.numDOFs);
+            G.jacobiOmega,
+            fine.numDOFs
+        );
 
         CUDA_CHECK(cudaGetLastError());
 
-        // Communicate
-    }
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-    zeroFixedDOFs(solver, finest.d_x);
+        // All GPUs finish this level before proceeding to the next finer level.
+        workerBarrier();
+    }
+    // TODO---> fixed-DOF indices must be local to the current GPU, and your correction output convention should clearly specify whether ghost nodes are included. THis is valid for everytime this is called.
+    zeroFixedDOFs(G, finest.d_x);
 
     if (d_fineCorrection != finest.d_x)
     {
-        CUDA_CHECK(
-            cudaMemcpy(
-                d_fineCorrection,
-                finest.d_x,
-                static_cast<size_t>(finest.numDOFs) * sizeof(double),
-                cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(
+            d_fineCorrection,
+            finest.d_x,
+            static_cast<size_t>(finest.numDOFs)
+                * sizeof(double),
+            cudaMemcpyDeviceToDevice
+        ));
     }
 }
 
@@ -2056,10 +2342,10 @@ __global__ void addReceivedInterfaceKernel(
 }
 
 static void copyBoundaryToHalo(
-    int8 sourceId,
-    double* d_sourceLocal,
-    int8 targetId,
-    double* d_recvLoval,
+    int sourceId,
+    const double* d_sourceLocal,
+    int targetId,
+    double* d_recvLocal,
     int numBoundaryNodes,
     cudaStream_t stream)
 {
@@ -2070,7 +2356,7 @@ static void copyBoundaryToHalo(
 
     // Copy boundary data to halo region on the same GPU
     CUDA_CHECK(cudaMemcpyPeerAsync(
-        d_recvLoval,
+        d_recvLocal,
         targetId,
         d_sourceLocal,
         sourceId,
@@ -2078,23 +2364,6 @@ static void copyBoundaryToHalo(
         stream));
 }
 
-static cudaError_t sendOneSideHalo(singleGPUData& G, HaloSide& S, cudaStream_t stream,
-                               const std::vector<singleGPUData>& gpuData)
-{
-    if (S.sendLocal.empty()) return cudaSuccess;
-    if (S.neighborGPU < 0) return cudaErrorInvalidDevice;
-    const int count = (int)S.sendLocal.size();
-    const int block = 256;
-    const int grid = (count + block - 1) / block;
-    packHaloKernel<<<grid, block, 0, stream>>>(
-        G.levels[x].d_fineResidual, S.d_sendLocal, S.d_sendBuffer, count);
-    cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) return error;
-    double* recv = gpuData[S.neighborGPU].levels[0].d_fineResidual
-                   + 3 * ((size_t)S.sendDestLocal[0] - 1);
-    return copyBoundaryToHalo(G.deviceId, S.d_sendBuffer,
-                              S.neighborGPU, recv, count, stream);
-}
 static void sendOneSideInterface(
     singleGPUData& G,
     InterfaceSide& S,
@@ -2139,7 +2408,7 @@ static void applyFinestOperator(
     singleGPUData& G,
     const double* d_x,
     double* d_Ax,
-    std::vector<StreamData>& comm_stream,
+    StreamData& streams,
     const std::vector<singleGPUData>& gpuData)
 {
     const int numGPUs = G.numGPUs;
@@ -2148,9 +2417,21 @@ static void applyFinestOperator(
     constexpr int blockSize = 256;
 
     Level& finest = G.levels[0];
-    StreamData& streams = comm_stream[deviceId];
 
-    CUDA_CHECK(cudaSetDevice(deviceId));
+    // Before SpMV, exchange x ghost values. Use matching neighbor vector.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    workerBarrier();
+    for (const bool right : {true, false}) {
+        HaloSide& side = right ? finest.right : finest.left;
+        if (side.neighborGPU < 0 || side.sendLocal.empty()) continue;
+        const singleGPUData& neighbor = gpuData[side.neighborGPU];
+        double* dst = (d_x == G.d_y) ? neighbor.d_y : neighbor.d_p;
+        sendOneSideHalo(G.deviceId, side, d_x, side.neighborGPU, dst,
+                            right ? streams.rightStream : streams.leftStream);
+    }
+    if (finest.right.neighborGPU >= 0) CUDA_CHECK(cudaStreamSynchronize(streams.rightStream));
+    if (finest.left.neighborGPU >= 0) CUDA_CHECK(cudaStreamSynchronize(streams.leftStream));
+    workerBarrier();
 
     const int gridSize = gridSizeFor(finest.numNodes, blockSize);
 
@@ -2207,7 +2488,7 @@ static void applyFinestOperator(
     }
 
     // Every thread has finished its outgoing copies.
-    #pragma omp barrier
+    workerBarrier();
 
     InterfaceSide& left  = finest.leftInterface;
     InterfaceSide& right = finest.rightInterface;
@@ -2218,7 +2499,7 @@ static void applyFinestOperator(
         const int grid = gridSizeFor(left.recvCount, blockSize);
 
         addReceivedInterfaceKernel
-            <<<grid, blockSize, 0, streams.leftStream>>>(
+            <<<grid, blockSize>>>(
                 d_Ax,
                 left.d_recvBuffer,
                 left.d_recvLocal,
@@ -2235,7 +2516,7 @@ static void applyFinestOperator(
             gridSizeFor(right.recvCount, blockSize);
 
         addReceivedInterfaceKernel
-            <<<grid, blockSize, 0, streams.rightStream>>>(
+            <<<grid, blockSize>>>(
                 d_Ax,
                 right.d_recvBuffer,
                 right.d_recvLocal,
@@ -2248,105 +2529,271 @@ static void applyFinestOperator(
     // Wait until both accumulations are finished
     if (left.recvCount > 0)
     {
-        CUDA_CHECK(cudaStreamSynchronize(streams.leftStream));
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     if (right.recvCount > 0)
     {
-        CUDA_CHECK(cudaStreamSynchronize(streams.rightStream));
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     // Apply fixed DOF constraints to the result vector.
     zeroFixedDOFs(G, d_Ax);
     CUDA_CHECK(cudaDeviceSynchronize());
-    #pragma omp barrier
+    workerBarrier();
 }
 
 
-static void runMGPCG(
-    std::vector<singleGPUData&> solver,
-    std::vector<StreamData>& comm_stream,
-    int8 numGPUs)
+
+// Own only resources instantiated inside runMGPCG. Existing solver buffers
+// and cuDSS data remain under their existing ownership/cleanup contract.
+class ScopedCommunicationStreams
 {
-    std::vector<ncclComm_t> comms(numGPUs);
+    std::vector<singleGPUData>& gpuData_;
+public:
+    explicit ScopedCommunicationStreams(std::vector<singleGPUData>& gpuData)
+        : gpuData_(gpuData) {}
 
+    void cleanup() noexcept
+    {
+        for (auto& gpu : gpuData_)
+        {
+            if (cudaSetDevice(gpu.deviceId) != cudaSuccess)
+                continue;
+            StreamData& streams = gpu.streams;
+            if (streams.leftStream) {
+                (void)cudaStreamDestroy(streams.leftStream);
+                streams.leftStream = nullptr;
+            }
+            if (streams.rightStream) {
+                (void)cudaStreamDestroy(streams.rightStream);
+                streams.rightStream = nullptr;
+            }
+            if (streams.ncclStream) {
+                (void)cudaStreamDestroy(streams.ncclStream);
+                streams.ncclStream = nullptr;
+            }
+            if (streams.computeStream) {
+                (void)cudaStreamDestroy(streams.computeStream);
+                streams.computeStream = nullptr;
+            }
+        }
+    }
 
-    const int plannedHostNumThreads = numGPUs;
+    void cleanupChecked()
+    {
+        for (auto& gpu : gpuData_)
+        {
+            CUDA_CHECK(cudaSetDevice(gpu.deviceId));
+            StreamData& streams = gpu.streams;
+            cudaStream_t* entries[] = {
+                &streams.leftStream, &streams.rightStream,
+                &streams.ncclStream, &streams.computeStream
+            };
+            for (cudaStream_t* entry : entries)
+            {
+                if (!*entry) continue;
+                cudaStream_t temporary = *entry;
+                *entry = nullptr;
+                CUDA_CHECK(cudaStreamDestroy(temporary));
+            }
+        }
+    }
+
+    ~ScopedCommunicationStreams() noexcept { cleanup(); }
+    ScopedCommunicationStreams(const ScopedCommunicationStreams&) = delete;
+    ScopedCommunicationStreams& operator=(const ScopedCommunicationStreams&) = delete;
+};
+
+class ScopedNcclCommunicators
+{
+    std::vector<ncclComm_t>& comms_;
+    std::atomic<bool> aborted_{false};
+public:
+    explicit ScopedNcclCommunicators(std::vector<ncclComm_t>& comms)
+        : comms_(comms) {}
+
+    // Called only after a worker has reported an error. Do not mutate entries
+    // here: another worker can still be using its communicator concurrently.
+    void abortAll() noexcept
+    {
+        if (aborted_.exchange(true, std::memory_order_acq_rel)) return;
+        for (ncclComm_t comm : comms_)
+            if (comm) (void)ncclCommAbort(comm);
+    }
+
+    void destroyChecked()
+    {
+        if (aborted_.load(std::memory_order_acquire)) return;
+        for (ncclComm_t& comm : comms_)
+        {
+            if (!comm) continue;
+            ncclComm_t tmp = comm;
+            comm = nullptr;
+            NCCL_CHECK(ncclCommDestroy(tmp));
+        }
+    }
+
+    ~ScopedNcclCommunicators() noexcept
+    {
+        if (!aborted_.load(std::memory_order_acquire))
+            abortAll();
+    }
+    ScopedNcclCommunicators(const ScopedNcclCommunicators&) = delete;
+    ScopedNcclCommunicators& operator=(const ScopedNcclCommunicators&) = delete;
+};
+
+static void runMGPCG(
+    std::vector<singleGPUData>& gpuData,
+    GlobalCoarseSolve& globalCoarse,
+    VcycleShared& vcycleShared,
+    int numGPUs)
+{
+    std::vector<ncclComm_t> comms(numGPUs, nullptr);
+    ScopedCommunicationStreams streamsOwner(gpuData);
+    ScopedNcclCommunicators communicatorsOwner(comms);
+    FailureAwareBarrier failureBarrier(numGPUs);
+
     const int cpu_cores = omp_get_num_procs();
     mexPrintf("CPU logical threads available: %d\n", cpu_cores);
-    omp_set_dynamic(0);
-    omp_set_num_threads(plannedHostNumThreads);
 
-    for (auto& s : solver)
+    omp_set_dynamic(0);
+    omp_set_num_threads(numGPUs);
+
+    for (auto& s : gpuData)
     {
-        if (!s.initialized || s.levels.empty() || s.cublasHandle == nullptr)
+        if (!s.initialized || s.levels.empty())
         {
-            throw std::runtime_error("The solver context is not fully initialized.");
+            throw std::runtime_error(
+                "The solver context is not fully initialized.");
+        }
+
+        if (s.deviceId < 0 || s.deviceId >= numGPUs)
+        {
+            throw std::runtime_error(
+                "Invalid device ID in solver context.");
+        }
+
+        if (s.cublasHandle == nullptr)
+        {
+            throw std::runtime_error(
+                "CUBLAS handle is not initialized.");
         }
     }
-    
-    for (int i = 0; i < numGPUs; ++i) {
-        CUDA_CHECK(cudaSetDevice(gpuData[i].deviceId));
-        int leastPriority = 0, greatestPriority = 0;
-        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority));
 
-        NCCL_CHECK(ncclCommInitRank(&comms[i], numGPUs, ncclId, i));
+    // Initialize NCCL communicators.
+    std::vector<int> deviceIds(numGPUs);
+
+    for (int i = 0; i < numGPUs; ++i)
+        deviceIds[i] = gpuData[i].deviceId;
+
+    NCCL_CHECK(ncclCommInitAll(
+        comms.data(),
+        numGPUs,
+        deviceIds.data()));
+
+    // Initialize communication streams.------->TODO: put this in initializationFunction
+    for (int i = 0; i < numGPUs; ++i)
+    {
+        CUDA_CHECK(cudaSetDevice(gpuData[i].deviceId));
+
+        int leastPriority = 0;
+        int greatestPriority = 0;
+
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(
+            &leastPriority,
+            &greatestPriority));
 
         const int priority = greatestPriority;
-        if (i > 0) {
+
+        if (i > 0)
+        {
             CUDA_CHECK(cudaStreamCreateWithPriority(
-                &comm_stream[i].leftStream, cudaStreamNonBlocking, priority));
+                &gpuData[i].streams.leftStream,
+                cudaStreamNonBlocking,
+                priority));
         }
-        if (i < numGPUs - 1) {
+
+        if (i < numGPUs - 1)
+        {
             CUDA_CHECK(cudaStreamCreateWithPriority(
-                &comm_stream[i].rightStream, cudaStreamNonBlocking, priority));
+                &gpuData[i].streams.rightStream,
+                cudaStreamNonBlocking,
+                priority));
         }
+
+        CUDA_CHECK(cudaStreamCreateWithPriority(
+            &gpuData[i].streams.ncclStream,
+            cudaStreamNonBlocking,
+            priority));
+
+        CUDA_CHECK(cudaStreamCreateWithPriority(
+            &gpuData[i].streams.computeStream,
+            cudaStreamNonBlocking,
+            priority));
+
     }
 
-    for (int i = 0; i < numGPUs; ++i) {
-        singleGPUData& solver = gpuData[i];
+    const double one = 1.0;
+    const double minusOne = -1.0;
+
+    {
+    ScopedNvtxRange mainLoopRange("MGPCG:mainLoop");
+
+    // One CPU thread per GPU.
+
+    #pragma omp parallel num_threads(numGPUs)
+    {
+        const int g = omp_get_thread_num();
+        ScopedWorkerBarrier workerGuard(failureBarrier);
+        try
+        {
+
+        singleGPUData& solver = gpuData[g];
+
+        CUDA_CHECK(cudaSetDevice(solver.deviceId));
+
+        const int n = solver.levels[0].numDOFs;
+        cublasHandle_t handle = solver.cublasHandle;
+
         solver.iterations = 0;
         solver.relativeResidual = 0.0;
         solver.converged = false;
 
         zeroFixedDOFs(solver, solver.d_r);
         zeroFixedDOFs(solver, solver.d_y);
-    }
+
+        const ncclComm_t comm = comms[g];
+        StreamData& streams = solver.streams;
     
-    const int n = solver.levels[0].numDOFs;
+        // Ensure constraints are applied before reductions.
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-    //cublasHandle_t handle = solver.cublasHandle;
+        // -------------------------------------------------
+        // Initial global norm
+        // -------------------------------------------------
 
-    const double one = 1.0;
-    const double minusOne = -1.0;
+        double normB = 0.0;
 
-    double normB = 0.0;
-    
-    // Global op
-    CUBLAS_CHECK(
-        cublasDnrm2(
-            handle,
-            n,
-            solver.d_r,
-            1,
-            &normB));
+        globalNorm(
+            normB,
+            solver,
+            comm,
+            streams.ncclStream,
+            solver.d_r
+        );
 
-    // r = b - A*y
-    #pragma omp parallel num_threads(numGPUs)
-    {
-        int g = omp_get_thread_num();
-        singleGPUData& solver = gpuData[g];
-        CUDA_CHECK(cudaSetDevice(g));
+        // r = b - A*y
 
         applyFinestOperator(
-            gpuData[g],
-            gpuData,
-            d_x[g],
-            d_Ax[g],
-            comm_stream[g]
+            solver,
+            solver.d_y,
+            solver.d_Ap,
+            streams,
+            gpuData
         );
-        #pragma omp barrier
-        // Local op
+
+        // Local operation
         CUBLAS_CHECK(
             cublasDaxpy(
                 handle,
@@ -2356,347 +2803,365 @@ static void runMGPCG(
                 1,
                 solver.d_r,
                 1));
-        #pragma omp barrier
+
         zeroFixedDOFs(solver, solver.d_r);
-        #pragma omp barrier
 
-    }
+        // Calculate the initial residual norm
 
-    double residualNorm = 0.0;
-    
-    //Global op
-    CUBLAS_CHECK(
-        cublasDnrm2(
-            handle,
-            n,
-            solver.d_r,
-            1,
-            &residualNorm));
+        double residualNorm = 0.0;
 
-    const double residualDenominator = (normB > 0.0) ? normB : 1.0;
-    double relativeResidual = residualNorm / residualDenominator;
-    // Broadcast the initial relative residual to all GPUs
-    #pragma omp parallel num_threads(numGPUs)
-    {
-        int g = omp_get_thread_num();
-        singleGPUData& solver = gpuData[g];
-        solver.relativeResidual = relativeResidual;
-        if (!std::isfinite(solver.relativeResidual))
-        {
-            throw std::runtime_error("The initial relative residual is not finite.");
-        }
+        globalNorm(
+            residualNorm,
+            solver,
+            comm,
+            streams.ncclStream,
+            solver.d_r
+        );
 
-        if (solver.relativeResidual < solver.tolerance || residualNorm == 0.0)
-        {
-            solver.converged = true;
-            return;
-        }
-    }
+        const double residualDenominator =
+            (normB > 0.0) ? normB : 1.0;
 
-    // z = M^{-1}r; p = z; rho = z'*r
-    // Local to global
-    applyVcycle(solver, solver.d_r, solver.d_Ap);
-
-    CUBLAS_CHECK(
-        cublasDcopy(
-            handle,
-            n,
-            solver.d_Ap,
-            1,
-            solver.d_p,
-            1));
-
-    double rho = 0.0;
-
-    CUBLAS_CHECK(
-        cublasDdot(
-            handle,
-            n,
-            solver.d_Ap,
-            1,
-            solver.d_r,
-            1,
-            &rho));
-
-    if (!std::isfinite(rho) || rho <= 0.0)
-    {
-        throw std::runtime_error("PCG breakdown: the initial z'*r is non-positive or non-finite.");
-    }
-    #pragma omp barrier
-    // Start the main PCG iteration loop.
-    nvtxRangePushA("MGPCG:mainLoop");
-    for (int its = 1; its <= solver.maxIterations; ++its)
-    {
-        nvtxRangePushA("MGPCG:applyFinestOperator");
-        applyFinestOperator(solver, solver.d_p, solver.d_Ap);
-        nvtxRangePop();
-        double pAp = 0.0;
-
-        // Global op
-        CUBLAS_CHECK(
-            cublasDdot(
-                handle,
-                n,
-                solver.d_p,
-                1,
-                solver.d_Ap,
-                1,
-                &pAp));
-
-        if (!std::isfinite(pAp) || pAp <= 0.0)
-        {
-            char message[512];
-            std::snprintf(
-                message,
-                sizeof(message),
-                "PCG breakdown at iteration %d: p'*A*p is non-positive or non-finite.",
-                its);
-            throw std::runtime_error(message);
-        }
-
-        const double alpha = rho / pAp;
-
-        if (!std::isfinite(alpha))
-        {
-            throw std::runtime_error("PCG breakdown: alpha is not finite.");
-        }
-
-        const double minusAlpha = -alpha;
-
-        // Local op
-        CUBLAS_CHECK(
-            cublasDaxpy(
-                handle,
-                n,
-                &alpha,
-                solver.d_p,
-                1,
-                solver.d_y,
-                1));
-        
-        // Local op
-        CUBLAS_CHECK(
-            cublasDaxpy(
-                handle,
-                n,
-                &minusAlpha,
-                solver.d_Ap,
-                1,
-                solver.d_r,
-                1));
-
-        // Zeroes out the entries corresponding to fixed degrees of freedom
-        zeroFixedDOFs(solver, solver.d_y);
-        zeroFixedDOFs(solver, solver.d_r);
-        
-        // Global op
-        CUBLAS_CHECK(
-            cublasDnrm2(
-                handle,
-                n,
-                solver.d_r,
-                1,
-                &residualNorm));
-
-        solver.iterations = its;
-        solver.relativeResidual = residualNorm / residualDenominator;
+        solver.relativeResidual =
+            residualNorm / residualDenominator;
 
         if (!std::isfinite(solver.relativeResidual))
         {
-            throw std::runtime_error("PCG produced a non-finite relative residual.");
+            throw std::runtime_error(
+                "The initial relative residual is not finite.");
         }
 
-        if (solver.relativeResidual < solver.tolerance)
+        if (solver.relativeResidual < solver.tolerance ||
+            residualNorm == 0.0)
         {
             solver.converged = true;
-
-            MEX_PRINT("CG solver converged at iteration %d with relative residual %.6e",
-                its,
-                solver.relativeResidual);
-            break;
         }
-        nvtxRangePushA("MGPCG:applyVcycle2");
-        #pragma omp parallel num_threads(numGPUs)
+
+        // Initial preconditioning:
+        // z = M^-1*r
+        // p = z
+        // rho = z'*r
+
+        double rho = 0.0;
+
+        // All workers make the same initial convergence decision because residualNorm is global.
+        if (!solver.converged)
         {
-            const int g = omp_get_thread_num();
-
-            CUDA_CHECK(cudaSetDevice(g));
-
-            singleGPUData& G = gpuData[g];
-
             applyVcycle(
-                G,
-                G.d_r,
-                G.d_Ap,
+                solver,
+                solver.d_r,
+                solver.d_Ap,
                 gpuData,
-                comm_stream,
+                streams,
+                comms,
                 globalCoarse,
                 vcycleShared
             );
-        }      
-        double rhoNew = 0.0;
 
-        // Global op
-        CUBLAS_CHECK(
-            cublasDdot(
-                handle,
-                n,
-                solver.d_Ap,
-                1,
-                solver.d_r,
-                1,
-                &rhoNew));
+            // Local operation: p = z
+            CUBLAS_CHECK(
+                cublasDcopy(
+                    handle,
+                    n,
+                    solver.d_Ap,
+                    1,
+                    solver.d_p,
+                    1));
 
-        if (!std::isfinite(rhoNew) || rhoNew <= 0.0)
-        {
-            char message[512];
-            std::snprintf(
-                message,
-                sizeof(message),
-                "PCG breakdown at iteration %d: z'*r is non-positive or non-finite.",
-                its);
-            throw std::runtime_error(message);
-        }
-
-        const double beta = rhoNew / rho;
-
-        if (!std::isfinite(beta))
-        {
-            throw std::runtime_error("PCG breakdown: beta is not finite.");
-        }
-
-        // p = z + beta*p
-        // Local op
-        CUBLAS_CHECK(
-            cublasDscal(
-                handle,
-                n,
-                &beta,
-                solver.d_p,
-                1));
-        
-        // Local op
-        CUBLAS_CHECK(
-            cublasDaxpy(
-                handle,
-                n,
-                &one,
-                solver.d_Ap,
-                1,
-                solver.d_p,
-                1));
-
-        rho = rhoNew;
-    }
-
-    nvtxRangePop();
-
-    if (!solver.converged && solver.iterations == solver.maxIterations)
-    {
-        mexWarnMsgIdAndTxt(
-            "mgpcg_gpu:maxIterations",
-            "Exceeded the maximum iteration count. Final relative residual: %.6e.",
-            solver.relativeResidual);
-    }
-}
-
-static void createMATLABOutputs(
-    const SolverContext& solver,
-    int nlhs,
-    mxArray* plhs[])
-{
-    plhs[0] = mxCreateDoubleMatrix( solver.outputRows, solver.outputCols, mxREAL);
-
-    CUDA_CHECK(
-        cudaMemcpy(mxGetData(plhs[0]), solver.d_y,
-            static_cast<size_t>(solver.levels[0].numDOFs) * sizeof(double),
-            cudaMemcpyDeviceToHost));
-
-    if (nlhs >= 2)
-    {
-        plhs[1] = mxCreateDoubleScalar(static_cast<double>(solver.iterations));
-    }
-
-    if (nlhs >= 3)
-    {
-        plhs[2] = mxCreateDoubleScalar(solver.relativeResidual);
-    }
-}
-
-void mexFunction(
-    int nlhs,
-    mxArray* plhs[],
-    int nrhs,
-    const mxArray* prhs[])
-{
-    if (nrhs != 5)
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:nrhs",
-            "Usage: [y, iterations, relativeResidual] = Solving_MGPCG_GPU(b, tolerance, maxIterations, y0, H)");
-    }
-
-    if (nlhs < 1 || nlhs > 3)
-    {
-        mexErrMsgIdAndTxt(
-            "mgpcg_gpu:nlhs", "The function supports one to three outputs.");
-    }
-
-    if (!mxIsDouble(prhs[1]) || mxIsComplex(prhs[1]) || mxGetNumberOfElements(prhs[1]) != 1)
-    {
-        mexErrMsgIdAndTxt("mgpcg_gpu:tolerance", "tolerance must be a real double scalar.");
-    }
-
-    if (!mxIsDouble(prhs[2]) || mxIsComplex(prhs[2]) || mxGetNumberOfElements(prhs[2]) != 1)
-    {
-        mexErrMsgIdAndTxt("mgpcg_gpu:maxIterations", "maxIterations must be a real double scalar containing a positive integer.");
-    }
-
-    const double tolerance = mxGetScalar(prhs[1]);
-    const double maxIterationsValue = mxGetScalar(prhs[2]);
-
-    if (!std::isfinite(maxIterationsValue) || maxIterationsValue < 1.0 || std::floor(maxIterationsValue) != maxIterationsValue || maxIterationsValue > static_cast<double>(INT_MAX))
-    {
-        mexErrMsgIdAndTxt("mgpcg_gpu:maxIterations", "maxIterations must be a positive integer representable by int.");
-    }
-
-    const int maxIterations = static_cast<int>(maxIterationsValue);
-
-    std::string failureMessage;
-    {
-        SolverContext solver;
-        try
-        {
-            initializeGPUHierarchy(
+            // Global rho = z'*r
+            rho = globalDotProduct(
                 solver,
-                prhs[4],
-                prhs[0],
-                prhs[3],
-                tolerance,
-                maxIterations);
+                comm,
+                streams.ncclStream,
+                solver.d_Ap,
+                solver.d_r
+            );
 
-            initializeGPU(solver);
-
-            runMGPCG(solver);
-
-            createMATLABOutputs(solver, nlhs, plhs);
+            if (!std::isfinite(rho) || rho <= 0.0)
+            {
+                throw std::runtime_error(
+                    "PCG breakdown: initial z'*r is "
+                    "non-positive or non-finite.");
+            }
         }
-        catch (const std::exception& exception)
+
+        // Main PCG iteration loop
+
+        for (int its = 1;
+             !solver.converged && its <= solver.maxIterations;
+             ++its)
         {
-            failureMessage =
-                exception.what();
+            // Ap = A*p
+
+            applyFinestOperator(
+                solver,
+                solver.d_p,
+                solver.d_Ap,
+                streams,
+                gpuData
+            );
+
+            // Global pAp = p'*A*p
+            double pAp = globalDotProduct(
+                solver,
+                comm,
+                streams.ncclStream,
+                solver.d_p,
+                solver.d_Ap
+            );
+
+            if (!std::isfinite(pAp) || pAp <= 0.0)
+            {
+                char message[512];
+
+                std::snprintf(
+                    message,
+                    sizeof(message),
+                    "PCG breakdown at iteration %d: "
+                    "p'*A*p is non-positive or non-finite.",
+                    its);
+
+                throw std::runtime_error(message);
+            }
+
+            const double alpha = rho / pAp;
+
+            if (!std::isfinite(alpha))
+            {
+                throw std::runtime_error(
+                    "PCG breakdown: alpha is not finite.");
+            }
+
+            const double minusAlpha = -alpha;
+
+            // y = y + alpha*p
+
+            CUBLAS_CHECK(
+                cublasDaxpy(
+                    handle,
+                    n,
+                    &alpha,
+                    solver.d_p,
+                    1,
+                    solver.d_y,
+                    1));
+
+            // r = r - alpha*Ap
+
+            CUBLAS_CHECK(
+                cublasDaxpy(
+                    handle,
+                    n,
+                    &minusAlpha,
+                    solver.d_Ap,
+                    1,
+                    solver.d_r,
+                    1));
+
+            zeroFixedDOFs(solver, solver.d_y);
+            zeroFixedDOFs(solver, solver.d_r);
+
+            // Global residual norm
+
+            globalNorm(
+                residualNorm,
+                solver,
+                comm,
+                streams.ncclStream,
+                solver.d_r
+            );
+
+            solver.iterations = its;
+
+            solver.relativeResidual = residualNorm / residualDenominator;
+
+            if (!std::isfinite(solver.relativeResidual))
+            {
+                throw std::runtime_error(
+                    "PCG produced a non-finite "
+                    "relative residual.");
+            }
+
+            if (solver.relativeResidual < solver.tolerance)
+            {
+                solver.converged = true;
+                break;
+            }
+
+            // z = M^-1*r
+
+            {
+            ScopedNvtxRange vcycleRange("MGPCG:applyVcycle2");
+
+            applyVcycle(
+                solver,
+                solver.d_r,
+                solver.d_Ap,
+                gpuData,
+                streams,
+                comms,
+                globalCoarse,
+                vcycleShared
+            );
+
+            }
+
+            // Global rhoNew = z'*r
+
+            double rhoNew = globalDotProduct(
+                solver,
+                comm,
+                streams.ncclStream,
+                solver.d_Ap,
+                solver.d_r
+            );
+
+            if (!std::isfinite(rhoNew) || rhoNew <= 0.0)
+            {
+                char message[512];
+
+                std::snprintf(
+                    message,
+                    sizeof(message),
+                    "PCG breakdown at iteration %d: "
+                    "z'*r is non-positive or non-finite.",
+                    its);
+
+                throw std::runtime_error(message);
+            }
+
+            const double beta = rhoNew / rho;
+
+            if (!std::isfinite(beta))
+            {
+                throw std::runtime_error(
+                    "PCG breakdown: beta is not finite.");
+            }
+
+            // p = z + beta*p
+
+            // Local operation: p = beta*p
+            CUBLAS_CHECK(
+                cublasDscal(
+                    handle,
+                    n,
+                    &beta,
+                    solver.d_p,
+                    1));
+
+            // Local operation: p = z + p
+            CUBLAS_CHECK(
+                cublasDaxpy(
+                    handle,
+                    n,
+                    &one,
+                    solver.d_Ap,
+                    1,
+                    solver.d_p,
+                    1));
+
+            rho = rhoNew;
+        }
         }
         catch (...)
         {
-            failureMessage =
-                "Unknown C++ exception in Solving_MGPCG_GPU.";
+            failureBarrier.fail(std::current_exception());
+            // Failure path only: release peers potentially waiting on NCCL.
+            communicatorsOwner.abortAll();
         }
-
-        destroySolver(solver);
     }
 
-    if (!failureMessage.empty())
+    } // End NVTX main-loop range.
+
+    if (std::exception_ptr failure = failureBarrier.error())
+        std::rethrow_exception(failure);
+
+    // Every GPU should have the same convergence state.
+    const singleGPUData& result = gpuData[0];
+
+    if (result.converged)
     {
-        mexErrMsgIdAndTxt("mgpcg_gpu:runtime","%s",failureMessage.c_str());
+        MEX_PRINT(
+            "CG solver converged at iteration %d "
+            "with relative residual %.6e",
+            result.iterations,
+            result.relativeResidual);
+    }
+    else if (result.iterations == result.maxIterations)
+    {
+        mexWarnMsgIdAndTxt(
+            "mgpcg_gpu:maxIterations",
+            "Exceeded the maximum iteration count. "
+            "Final relative residual: %.6e.",
+            result.relativeResidual);
+    }
+
+    // Success path. On exceptions, RAII aborts communicators and destroys streams.
+    communicatorsOwner.destroyChecked();
+    streamsOwner.cleanupChecked();
+}
+
+static void createMATLABOutputs(const std::vector<singleGPUData>& Gs,
+                                const mxArray* bMx, int nlhs, mxArray* plhs[])
+{
+    plhs[0]=mxCreateDoubleMatrix(mxGetM(bMx),mxGetN(bMx),mxREAL);
+    if (!plhs[0]) throw std::runtime_error("Could not allocate MATLAB output.");
+    double* out=static_cast<double*>(mxGetData(plhs[0]));
+    const size_t globalDOFs=mxGetNumberOfElements(bMx);
+    std::fill(out,out+globalDOFs,0.0);
+    for (const singleGPUData& G: Gs) {
+        CUDA_CHECK(cudaSetDevice(G.deviceId));
+        const Level& fine=G.levels.front();
+        std::vector<double> local(fine.numDOFs);
+        CUDA_CHECK(cudaMemcpy(local.data(),G.d_y,size_t(fine.numDOFs)*sizeof(double),
+                              cudaMemcpyDeviceToHost));
+        for (int i=0;i<fine.numNodes;++i) {
+            if (!fine.ownedMask[i]) continue;
+            const size_t to=3*size_t(fine.globalNodeIds[i]-1), from=3*size_t(i);
+            for (int c=0;c<3;++c) out[to+c]=local[from+c];
+        }
+    }
+    if (nlhs>=2) plhs[1]=mxCreateDoubleScalar(double(Gs[0].iterations));
+    if (nlhs>=3) plhs[2]=mxCreateDoubleScalar(Gs[0].relativeResidual);
+}
+
+void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[])
+{
+    for (int i=0;i<nlhs;++i) plhs[i]=nullptr;
+    if (nrhs!=5)
+        mexErrMsgIdAndTxt("mgpcg_gpu:nrhs",
+            "Usage: [y, iterations, relativeResidual] = mgpcg_multigpu(b, tolerance, maxIterations, y0, H)");
+    if (nlhs<1 || nlhs>3)
+        mexErrMsgIdAndTxt("mgpcg_gpu:nlhs","One to three outputs are supported.");
+    if (!mxIsDouble(prhs[1]) || mxIsComplex(prhs[1]) || mxGetNumberOfElements(prhs[1])!=1 ||
+        !mxIsDouble(prhs[2]) || mxIsComplex(prhs[2]) || mxGetNumberOfElements(prhs[2])!=1)
+        mexErrMsgIdAndTxt("mgpcg_gpu:input","Tolerance and maxIterations must be real double scalars.");
+    const double tol=mxGetScalar(prhs[1]);
+    const double itValue=mxGetScalar(prhs[2]);
+    if (!(tol>0.0) || !std::isfinite(tol) || !std::isfinite(itValue) ||
+        itValue<1 || itValue>double(INT_MAX) || std::floor(itValue)!=itValue)
+        mexErrMsgIdAndTxt("mgpcg_gpu:input","Invalid tolerance or maxIterations.");
+    std::string failure;
+    {
+        std::vector<singleGPUData> Gs;
+        GlobalCoarseSolve C;
+        VcycleShared scratch;
+        try {
+            initializeGPUHierarchy(Gs,C,prhs[4],prhs[0],prhs[3],tol,int(itValue));
+            initializeGPUs(Gs,C);
+            runMGPCG(Gs,C,scratch,int(Gs.size()));
+            createMATLABOutputs(Gs,prhs[0],nlhs,plhs);
+        } catch (const std::exception& e) {
+            failure=e.what();
+        } catch (...) {
+            failure="Unexpected C++ exception in multi-GPU MGPCG solver.";
+        }
+        // Destroy coarse cuDSS first; everything it references lives on GPU 0.
+        destroySolver(C);
+        for (singleGPUData& G:Gs) destroySolver(G);
+    }
+    if (!failure.empty()) {
+        for (int i=0;i<nlhs;++i)
+            if (plhs[i]) { mxDestroyArray(plhs[i]); plhs[i]=nullptr; }
+        mexErrMsgIdAndTxt("mgpcg_gpu:runtime","%s",failure.c_str());
     }
 }

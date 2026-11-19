@@ -9,7 +9,7 @@ addpath('../src/MEXfuncs/');
 
 %% Multi-GPU configuration
 % Compile the multi-GPU CUDA source with this MEX name, or change it here.
-mgpuMexName = 'Solving_MGPCG_GPU';
+mgpuMexName = 'Solving_MGPCG_GPU_local';
 numGPUs = 2;            % Number of GPUs / partitions to validate (>= 2).
 assert(numGPUs >= 2 && numGPUs == floor(numGPUs), ...
     'For multi-GPU validation, numGPUs must be an integer >= 2.');
@@ -159,7 +159,7 @@ for testIndex = 1:numTests
     end
 
     hierarchyTimer = tic;
-    H_ = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverDataThisTest);
+    H_ = Build_GPU_Hierarchy_MGPU_2(meshHierarchy_, numGPUs, solverDataThisTest);
     hierarchyTime = toc(hierarchyTimer);
 
     % MATLAB sparse vectors can still be class 'double'. MEX code uses

@@ -9,7 +9,7 @@ addpath('../src/MEXfuncs/');
 
 %% Multi-GPU configuration
 % Compile the multi-GPU CUDA source with this MEX name, or change it here.
-mgpuMexName = 'Solving_MGPCG_GPU_local';
+mgpuMexName = 'Solving_MGPCG_MGPU_local';
 numGPUs = 2;            % Number of GPUs / partitions to validate (>= 2).
 assert(numGPUs >= 2 && numGPUs == floor(numGPUs), ...
     'For multi-GPU validation, numGPUs must be an integer >= 2.');
@@ -73,6 +73,7 @@ for testIndex = 1:numTests
     global U_;
     global tol_;
     global maxIT_;
+    global weightFactorJacobi_;
 
     outPath_ = '../out/';
 
@@ -166,15 +167,14 @@ for testIndex = 1:numTests
         meshHierarchy_(level).spanWidth = ...
             meshHierarchy_(level+1).spanWidth;
     end
-    if isfield(meshHierarchy_(1), 'weightFactorJacobi')
-        solverDataThisTest.jacobiOmega = ...
-            meshHierarchy_(1).weightFactorJacobi;
-    elseif isfield(meshHierarchy_(1), 'jacobiOmega')
-        solverDataThisTest.jacobiOmega = ...
-            meshHierarchy_(1).jacobiOmega;
-    else
-        error('Jacobi damping factor not found in mesh hierarchy.');
-    end
+    % Match the CPU Solving_Vcycle Jacobi damping factor exactly.
+    % Data_GlobalVariables initializes weightFactorJacobi_ as a global.
+    assert(isnumeric(weightFactorJacobi_) && isreal(weightFactorJacobi_) && ...
+           isscalar(weightFactorJacobi_) && isfinite(weightFactorJacobi_) && ...
+           weightFactorJacobi_ > 0, ...
+           'Global weightFactorJacobi_ is not initialized correctly.');
+    solverDataThisTest.jacobiOmega = double(weightFactorJacobi_);
+    fprintf('Using CPU Jacobi omega = %.6f\n', solverDataThisTest.jacobiOmega);
     H_ = Build_GPU_Hierarchy_MGPU_2( ...
         meshHierarchy_, numGPUs, solverDataThisTest);
     hierarchyTime = toc(hierarchyTimer);

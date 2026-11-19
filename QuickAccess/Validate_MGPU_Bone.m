@@ -159,6 +159,17 @@ for testIndex = 1:numTests
     end
 
     hierarchyTimer = tic;
+    fprintf('\n--- Checking multigrid span widths ---\n');
+
+    for k = 1:numel(meshHierarchy_)
+        fprintf('Level %d:\n', k);
+
+        if isfield(meshHierarchy_(k), 'spanWidth')
+            disp(meshHierarchy_(k).spanWidth);
+        else
+            fprintf('spanWidth field missing\n');
+        end
+    end
     H_ = Build_GPU_Hierarchy_MGPU_2(meshHierarchy_, numGPUs, solverDataThisTest);
     hierarchyTime = toc(hierarchyTimer);
 

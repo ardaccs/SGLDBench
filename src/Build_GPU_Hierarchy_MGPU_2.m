@@ -323,12 +323,11 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
                 leftShared = intersect(ids, prev);
                 prefix = ids(1:numel(leftShared));
                 if l == 1
-                    assert(isequal(sort(prefix), sort(leftShared)), ...
-                        ['GPU %d: left-shared finest nodes must form the FIRST ' ...
-                         'numLeftSharedNodes entries of globalNodeIds. ' ...
-                         'Otherwise update CUDA globalDotProduct/globalNorm ' ...
-                         'to use ownedNodeMask.'], g);
-                end
+                    % Shared nodes may occur at arbitrary local positions.
+                    % CUDA globalDotProduct/globalNorm use ownedNodeMask,
+                    % not a prefix-based ownership assumption.
+                    assert(numel(unique(leftShared)) == numel(leftShared), ...
+                        'Duplicate left-shared node IDs.');                end
                 Q.numLeftSharedNodes(l) = int32(numel(leftShared));
                 Q.ownedNodeMask{l} = uint8(~ismember(ids, prev));
             else

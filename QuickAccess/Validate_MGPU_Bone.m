@@ -175,6 +175,33 @@ for testIndex = 1:numTests
            'Global weightFactorJacobi_ is not initialized correctly.');
     solverDataThisTest.jacobiOmega = double(weightFactorJacobi_);
     fprintf('Using CPU Jacobi omega = %.6f\n', solverDataThisTest.jacobiOmega);
+    %% Coarsest-level sparse stiffness matrix for cuDSS
+
+    coarse = meshHierarchy_(end);
+
+    assert(isfield(coarse, 'Kfree') && ~isempty(coarse.Kfree), ...
+        'Coarsest Kfree was not assembled.');
+
+    assert(isfield(coarse, 'freeDOFs') && ~isempty(coarse.freeDOFs), ...
+        'Coarsest freeDOFs are missing.');
+
+    % Reuse exactly the matrix assembled for the CPU Cholesky solver.
+    solverDataThisTest.coarseKFree = sparse( ...
+        double(coarse.Kfree));
+
+    solverDataThisTest.coarseFreeDOFIds = int32( ...
+        coarse.freeDOFs(:));
+
+    % Validate matrix dimensions.
+    nFree = numel(solverDataThisTest.coarseFreeDOFIds);
+
+    assert(isequal(size(solverDataThisTest.coarseKFree), ...
+        [nFree, nFree]), ...
+        'Coarsest matrix dimensions do not match free DOFs.');
+
+    fprintf('Coarsest free DOFs: %d\n', nFree);
+    fprintf('Coarsest matrix NNZ: %d\n', ...
+        nnz(solverDataThisTest.coarseKFree));
     H_ = Build_GPU_Hierarchy_MGPU_2( ...
         meshHierarchy_, numGPUs, solverDataThisTest);
     hierarchyTime = toc(hierarchyTimer);

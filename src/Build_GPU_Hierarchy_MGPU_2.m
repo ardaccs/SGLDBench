@@ -1,5 +1,5 @@
-function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
-%BUILD_GPU_HIERARCHY Construct the input expected by multi-GPU initializeGPUHierarchy.
+function H = Build_GPU_Hierarchy_MGPU_2(meshHierarchy_, numGPUs, solverData)
+%BUILD_GPU_HIERARCHY_MGPU_2 Construct the input expected by multi-GPU initializeGPUHierarchy.
 %
 %   H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs)
 %   H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
@@ -36,19 +36,20 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
 %   P.nodMapForward{l} with indices numNodes(l)+1, ... . They are not included
 %   in P.numNodes or P.globalNodeIds.
 %
-% LIMITATIONS OF THE UNMODIFIED CUDA CODE
-%   - GPUs must be ordered along a 1D chain; missing halo nodes must be
+% ASSUMPTIONS OF THE DEPLOYED CUDA CODE
+%   - GPUs must be ordered along a *1D* chain; missing halo nodes must be
 %     available on an immediately adjacent GPU.
-%   - Finest-level nodes shared with the LEFT GPU must occupy the FIRST
-%     positions in that GPU's local node ordering (globalDotProduct/globalNorm
-%     currently use a prefix offset, not ownedNodeMask).
-%   - Coarsest normal-node IDs must partition the global coarse nodes exactly
-%     once: the existing gatherGlobalCoarseResidualKernel OVERWRITES entries.
+%   - Finest-level shared nodes can appear anywhere: global reductions use
+%     ownedNodeMask. Each global node must have exactly one owner.
+%   - Coarsest normal-node IDs may overlap at interfaces.
+%     Each global coarse node must have exactly one ownedNodeMask entry, because
+%     gatherGlobalCoarseResidualKernel writes only owned entries.
+%     Coarse RHS ownership is correct only if local coarse residuals have
+%     already incorporated contributions from neighboring partitions.
 %   - This builder DOES NOT change node numbering or assemble coarseKFree.
 %
 % MATLAB output is for the previous multi-GPU C++ initialization INL, *not*
 % for the original empty initializeGPUHierarchy() stubs.
-
     if nargin < 3
         solverData = struct();
     end
@@ -59,11 +60,9 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
     assert(isnumeric(numGPUs) && isscalar(numGPUs) && ...
         isfinite(numGPUs) && numGPUs >= 1 && numGPUs == floor(numGPUs), ...
         'numGPUs must be a positive integer.');
-
     numLevels = numel(meshHierarchy_);
     assert(numLevels >= 2, 'At least two multigrid levels are required.');
     numGPUs = double(numGPUs);
-
     % Global dense-grid geometry and index maps at every level.
     geo = repmat(struct('nx', 0, 'ny', 0, 'nz', 0, 'gridIds', [], ...
                         'forward', [], 'numNodes', 0), numLevels, 1);
@@ -78,7 +77,6 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
         gridSize = (geo(l).nx + 1) * (geo(l).ny + 1) * (geo(l).nz + 1);
         assert(gridSize <= double(intmax('int32')), ...
             'Dense grid at level %d exceeds int32 indexing.', l);
-
         assert(isfield(M, 'nodGridId'), ...
             'meshHierarchy_(%d).nodGridId is needed to build local maps/halos.', l);
         gridIds = checkedIds(M.nodGridId, gridSize, ...
@@ -89,14 +87,12 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
         geo(l).numNodes = numel(gridIds);
         geo(l).forward = zeros(gridSize, 1, 'int32');
         geo(l).forward(double(gridIds)) = int32((1:numel(gridIds))');
-
         if isfield(M, 'nodMapForward') && ~isempty(M.nodMapForward)
             map = int32(M.nodMapForward(:));
             assert(numel(map) == gridSize && isequal(map, geo(l).forward), ...
                 'meshHierarchy_(%d).nodMapForward disagrees with nodGridId.', l);
         end
     end
-
     span = zeros(numLevels-1, 1, 'int32');
     for l = 1:numLevels-1
         M = meshHierarchy_(l);
@@ -119,7 +115,6 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
             'Grid dimensions are inconsistent with spanWidth at level %d.', l);
         span(l) = int32(s);
     end
-
     H = struct();
     H.Ke = requiredGlobalDouble(solverData, meshHierarchy_, 'Ke');
     assert(isequal(size(H.Ke), [24, 24]) && all(isfinite(H.Ke(:))), ...
@@ -131,7 +126,6 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
     assert(isnumeric(omega) && isreal(omega) && isscalar(omega) && ...
            isfinite(omega), 'jacobiOmega / weightFactorJacobi is required.');
     H.jacobiOmega = double(omega);
-
     H.coarseKFree = firstGlobalField(solverData, meshHierarchy_, 'coarseKFree');
     coarseFree = firstGlobalField(solverData, meshHierarchy_, 'coarseFreeDOFIds');
     assert(issparse(H.coarseKFree) && isa(H.coarseKFree, 'double') && ...
@@ -145,14 +139,12 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
                    [numel(H.coarseFreeDOFIds), numel(H.coarseFreeDOFIds)]), ...
         'coarseKFree dimensions must match coarseFreeDOFIds.');
     H.globalCoarseNumNodes = int32(geo(end).numNodes);
-
     globalFixed = firstGlobalField(solverData, meshHierarchy_, 'fixedDOFIds');
     if isempty(globalFixed)
         globalFixed = int32([]);
     else
         globalFixed = checkedIds(globalFixed, 3 * geo(1).numNodes, 'fixedDOFIds');
     end
-
     H.partitions = cell(1, numGPUs);
     for g = 1:numGPUs
         Q = struct();
@@ -183,7 +175,6 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
         Q.rightInterfaceSendLocal = int32([]);
         Q.rightInterfaceSendDestLocal = int32([]);
         Q.sharedNodesLocal = cell(1, numGPUs);   % Original function's convention, finest only.
-
         for l = 1:numLevels
             M = meshHierarchy_(l);
             P = M.partitions{g};
@@ -206,7 +197,6 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
             Q.numNodes(l) = int32(n);
             Q.numDOFs(l) = int32(3*n);
             Q.nodGridId{l} = geo(l).gridIds(double(ids));
-
             haveConnectivity = isfield(P, 'nodeToElements') && ...
                                isfield(P, 'eNodMat') && ~isempty(P.nodeToElements);
             assert(l ~= 1 || haveConnectivity, ...
@@ -234,7 +224,6 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
                 assert(double(P.numElements) == double(Q.numElements(l)), ...
                     'GPU %d level %d numElements disagrees with connectivity.', g, l);
             end
-
             if l == 1
                 if isfield(P, 'eleModulus') && ~isempty(P.eleModulus)
                     modulus = double(P.eleModulus(:));
@@ -252,7 +241,6 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
             else
                 Q.eleModulus{l} = zeros(0, 1);
             end
-
             if l < numLevels
                 if isfield(P, 'diagK') && ~isempty(P.diagK)
                     localDiagonal = double(P.diagK(:));
@@ -273,7 +261,6 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
                 Q.diagK{l} = zeros(0, 1);
             end
         end
-
         % Convert GLOBAL fixed DOFs to partition-LOCAL finest DOFs, or use the
         % explicit P.fixedDOFIds (already local). Always preserve 1-based IDs.
         P1 = meshHierarchy_(1).partitions{g};
@@ -289,7 +276,6 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
         end
         H.partitions{g} = Q;
     end
-
     % Every global active node must appear among the normal nodes of at
     % least one GPU. Duplicate normals are permitted except at the final
     % coarse level, where the uploaded CUDA assembly requires ownership.
@@ -300,7 +286,6 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
         assert(isequal(represented, int32((1:geo(l).numNodes)')), ...
             'Some global active nodes at level %d have no GPU partition.', l);
     end
-
     % ---------------------------------------------------------------------
     % Shared/interface mappings. sendLocal and sendDestLocal have matching
     % ordering; the sender's destination entries refer to the OTHER GPU.
@@ -321,13 +306,13 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
             if g > 1
                 prev = H.partitions{g-1}.globalNodeIds{l};
                 leftShared = intersect(ids, prev);
-                prefix = ids(1:numel(leftShared));
                 if l == 1
                     % Shared nodes may occur at arbitrary local positions.
                     % CUDA globalDotProduct/globalNorm use ownedNodeMask,
                     % not a prefix-based ownership assumption.
                     assert(numel(unique(leftShared)) == numel(leftShared), ...
-                        'Duplicate left-shared node IDs.');                end
+                        'Duplicate left-shared node IDs.');
+                end
                 Q.numLeftSharedNodes(l) = int32(numel(leftShared));
                 Q.ownedNodeMask{l} = uint8(~ismember(ids, prev));
             else
@@ -336,7 +321,6 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
             H.partitions{g} = Q;
         end
     end
-
     for g = 1:numGPUs-1
         a = H.partitions{g};
         b = H.partitions{g+1};
@@ -352,16 +336,32 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
         H.partitions{g} = a;
         H.partitions{g+1} = b;
     end
-
-    % The existing coarse assembly overwrites instead of atomically adding.
-    coarseIds = cellfun(@(p) p.globalNodeIds{end}, H.partitions, ...
-                        'UniformOutput', false);
-    coarseIds = double(vertcat(coarseIds{:}));
-    assert(numel(coarseIds) == geo(end).numNodes && ...
-           isequal(sort(coarseIds), (1:geo(end).numNodes)'), ...
-        ['Global coarse nodes are duplicated or missing among partitions. ' ...
-         'Use a unique coarse-node owner or modify CUDA coarse assembly.']);
-
+    % Coarsest normal-node arrays MAY overlap across partition interfaces.
+    % The deployed CUDA gatherGlobalCoarseResidualKernel accepts ownedMask
+    % and writes only owned nodes into the global coarse RHS. Therefore it
+    % requires exactly one OWNER per global coarse node, not exactly one
+    % local appearance. Shared nodes remain available for local transfers.
+    nGlobalCoarse = double(geo(end).numNodes);
+    coarsePresence = zeros(nGlobalCoarse, 1, 'uint32');
+    coarseOwnerCount = zeros(nGlobalCoarse, 1, 'uint32');
+    for g = 1:numGPUs
+        ids = double(H.partitions{g}.globalNodeIds{end}(:));
+        owner = H.partitions{g}.ownedNodeMask{end}(:);
+        assert(numel(ids) == numel(owner) && ...
+               all(owner == 0 | owner == 1), ...
+               'GPU %d: invalid coarsest ownedNodeMask.', g);
+        assert(all(ids >= 1 & ids <= nGlobalCoarse), ...
+               'GPU %d: invalid global coarse-node IDs.', g);
+        coarsePresence(ids) = coarsePresence(ids) + uint32(1);
+        ownedIds = ids(logical(owner));
+        coarseOwnerCount(ownedIds) = coarseOwnerCount(ownedIds) + uint32(1);
+    end
+    assert(all(coarsePresence >= 1), ...
+        'Some global coarse nodes are missing from all partitions.');
+    assert(all(coarseOwnerCount == 1), ...
+        'Every global coarse node must have exactly one ownedNodeMask owner.');
+    fprintf('Coarse nodes: %d global, %d replicated appearances; unique ownership verified.\n', ...
+        nGlobalCoarse, sum(double(coarsePresence)) - nGlobalCoarse);
     % ---------------------------------------------------------------------
     % Halo maps for restriction and interpolation. A halo node is a global
     % node required by this partition's transfer stencil but not present
@@ -401,7 +401,6 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
             localMap(double(denseGridIds)) = int32((1:numel(localAndGhost))');
             Q.nodMapForward{l} = localMap;
             H.partitions{g} = Q;
-
             if nLeft > 0
                 sender = H.partitions{g-1};
                 [ok, sendLoc] = ismember(leftIds, sender.globalNodeIds{l});
@@ -422,7 +421,6 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
             end
         end
     end
-
     % Final checks: these are the constraints enforced by the CUDA parser.
     for g = 1:numGPUs
         Q = H.partitions{g};
@@ -435,7 +433,6 @@ function H = Build_GPU_Hierarchy(meshHierarchy_, numGPUs, solverData)
         end
     end
 end
-
 function ids = transferDependencyIds(l, g, parts, geo, span)
 % All global normal/ghost node IDs required by CUDA transfer kernels at l.
     required = int32([]);
@@ -485,7 +482,6 @@ function ids = transferDependencyIds(l, g, parts, geo, span)
     end
     ids = unique(required(required>0), 'stable');
 end
-
 function [y, x, z] = gridCoords(gridIds, G)
     zero = double(gridIds(:)) - 1;
     ny = G.ny + 1;
@@ -494,7 +490,6 @@ function [y, x, z] = gridCoords(gridIds, G)
     x = mod(floor(zero/ny), nx);
     z = floor(zero/(ny*nx));
 end
-
 function ids = checkedIds(values, upper, description)
     assert(isnumeric(values) && isreal(values), '%s must be numeric.', description);
     raw = double(values(:));
@@ -504,7 +499,6 @@ function ids = checkedIds(values, upper, description)
         '%s contains invalid/out-of-range 1-based IDs.', description);
     ids = int32(raw);
 end
-
 function n = requiredNonnegativeInteger(M, name, l)
     assert(isfield(M, name), 'meshHierarchy_(%d).%s is required.', l, name);
     n = double(M.(name));
@@ -512,13 +506,11 @@ function n = requiredNonnegativeInteger(M, name, l)
            n>=0 && n==floor(n) && n <= double(intmax('int32')), ...
         'meshHierarchy_(%d).%s must be a nonnegative int32-compatible integer.', l, name);
 end
-
 function value = requiredGlobalDouble(solverData, hierarchy, name)
     value = firstGlobalField(solverData, hierarchy, name);
     assert(isa(value, 'double') && isreal(value) && ~isempty(value), ...
         'Global %s must be supplied as a real double array.', name);
 end
-
 function value = firstGlobalField(solverData, hierarchy, name)
     value = [];
     if isfield(solverData, name) && ~isempty(solverData.(name))

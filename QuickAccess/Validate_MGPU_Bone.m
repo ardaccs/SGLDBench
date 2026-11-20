@@ -557,7 +557,12 @@ function validateMGPUHierarchy(H, numGPUs, numLevels, globalFinestNodes)
         fineIds = double(P.globalNodeIds{1}(:));
         owned = logical(P.ownedNodeMask{1}(:));
         allOwned = [allOwned; fineIds(owned)]; %#ok<AGROW>
-        allCoarse = [allCoarse; double(P.globalNodeIds{end}(:))]; %#ok<AGROW>
+        % Replicated coarse interface nodes are allowed; only owners count.
+        coarseIds = double(P.globalNodeIds{end}(:));
+        coarseOwned = logical(P.ownedNodeMask{end}(:));
+        assert(numel(coarseIds) == numel(coarseOwned), ...
+            'GPU %d coarse ownedNodeMask length mismatch.', g);
+        allCoarse = [allCoarse; coarseIds(coarseOwned)]; %#ok<AGROW>
     end
     assert(all(allOwned>=1 & allOwned<=globalFinestNodes), ...
         'Finest ownership references out-of-range global nodes.');
@@ -566,10 +571,10 @@ function validateMGPUHierarchy(H, numGPUs, numLevels, globalFinestNodes)
         'Every global finest-level node must have exactly one GPU owner.');
     nCoarse = double(H.globalCoarseNumNodes);
     assert(all(allCoarse>=1 & allCoarse<=nCoarse), ...
-        'Coarsest ownership references out-of-range global nodes.');
+        'Coarsest owned global-node IDs are out of range.');
     counts = accumarray(allCoarse, 1, [nCoarse,1]);
     assert(all(counts==1), ...
-        'Every global coarse node must occur in exactly one GPU partition.');
+        'Every global coarse node must be owned by exactly one GPU.');
     for g = 1:numGPUs-1
         a = H.partitions{g};
         b = H.partitions{g+1};

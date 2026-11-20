@@ -160,65 +160,102 @@ for testIndex = 1:numTests
     end
 
     hierarchyTimer = tic;
-    fprintf('\n--- Checking multigrid span widths ---\n');
-    coarse = meshHierarchy_(end);
 
-    fprintf('\n--- Coarsest matrix diagnostics ---\n');
-    fprintf('Total coarse DOFs: %d\n', coarse.numDOFs);
-    fprintf('Number of free DOFs: %d\n', numel(coarse.freeDOFs));
-    fprintf('Kfree dimensions: %d x %d\n', ...
-        size(coarse.Kfree, 1), size(coarse.Kfree, 2));
-    fprintf('Solver free DOF IDs: %d\n', ...
-        numel(solverDataThisTest.coarseFreeDOFIds));
-    fprintf('Solver matrix dimensions: %d x %d\n', ...
-        size(solverDataThisTest.coarseKFree, 1), ...
-        size(solverDataThisTest.coarseKFree, 2));
-
-    fprintf('Free DOF range: %d to %d\n', ...
-        min(coarse.freeDOFs), max(coarse.freeDOFs));
-    % Convert destination-level spanWidth to source-level convention.
-    for level = 1:numel(meshHierarchy_)-1
-        meshHierarchy_(level).spanWidth = ...
-            meshHierarchy_(level+1).spanWidth;
+    %% 4a. Preserve the CPU hierarchy; adapt spans only for the GPU builder.
+    % The MATLAB mesh stores the transition span on the DESTINATION level:
+    % [0, 4, 2] for the current Bone hierarchy. The GPU builder expects
+    % the span on the SOURCE level: [4, 2].
+    gpuMeshHierarchy = meshHierarchy_;
+    numLevels = numel(meshHierarchy_);
+    fprintf('\n--- Multigrid transition span widths ---\n');
+    for level = 1:numLevels-1
+        span = double(meshHierarchy_(level+1).spanWidth);
+        assert(isscalar(span) && isfinite(span) && ...
+               span >= 1 && span == floor(span), ...
+               'Invalid transition span from level %d to %d.', level, level+1);
+        gpuMeshHierarchy(level).spanWidth = span;
+        fprintf('Level %d -> %d: spanWidth = %d\n', level, level+1, span);
     end
 
-    % Match the CPU Solving_Vcycle Jacobi damping factor exactly.
-    % Data_GlobalVariables initializes weightFactorJacobi_ as a global.
+    %% 4b. Use exactly the Jacobi damping from the CPU V-cycle.
     assert(isnumeric(weightFactorJacobi_) && isreal(weightFactorJacobi_) && ...
            isscalar(weightFactorJacobi_) && isfinite(weightFactorJacobi_) && ...
            weightFactorJacobi_ > 0, ...
            'Global weightFactorJacobi_ is not initialized correctly.');
     solverDataThisTest.jacobiOmega = double(weightFactorJacobi_);
     fprintf('Using CPU Jacobi omega = %.6f\n', solverDataThisTest.jacobiOmega);
-    %% Coarsest-level sparse stiffness matrix for cuDSS
 
+    %% 4c. Match the coarsest reduced stiffness matrix to its free DOFs.
     coarse = meshHierarchy_(end);
-
     assert(isfield(coarse, 'Kfree') && ~isempty(coarse.Kfree), ...
         'Coarsest Kfree was not assembled.');
-
     assert(isfield(coarse, 'freeDOFs') && ~isempty(coarse.freeDOFs), ...
         'Coarsest freeDOFs are missing.');
 
-    % Reuse exactly the matrix assembled for the CPU Cholesky solver.
-    solverDataThisTest.coarseKFree = sparse( ...
-        double(coarse.Kfree));
+    Kfree = coarse.Kfree;  % Already sparse double in the CPU stencil assembly.
+    nTotal = double(coarse.numDOFs);
+    nMatrix = size(Kfree, 1);
+    assert(issparse(Kfree) && isa(Kfree, 'double') && isreal(Kfree) && ...
+           size(Kfree,2) == nMatrix, ...
+           'Coarsest Kfree must be square, real, sparse double.');
+    assert(all(isfinite(nonzeros(Kfree))), ...
+        'Coarsest Kfree contains NaN or Inf.');
 
-    solverDataThisTest.coarseFreeDOFIds = int32( ...
-        coarse.freeDOFs(:));
+    fprintf('\n--- Coarsest matrix diagnostics ---\n');
+    fprintf('Total coarse DOFs: %d\n', nTotal);
+    fprintf('Current freeDOFs count: %d\n', numel(coarse.freeDOFs));
+    fprintf('Kfree dimensions: %d x %d\n', nMatrix, nMatrix);
 
-    % Validate matrix dimensions.
-    nFree = numel(solverDataThisTest.coarseFreeDOFIds);
+    % Prefer IDs saved when Kfree was assembled: this preserves the exact
+    % row/column ordering used by the CPU factorization.
+    if isfield(coarse, 'KfreeDOFIds') && ...
+            numel(coarse.KfreeDOFIds) == nMatrix
+        free = double(coarse.KfreeDOFIds(:));
+        fprintf('Free DOF mapping source: KfreeDOFIds\n');
+    elseif numel(coarse.freeDOFs) == nMatrix
+        free = double(coarse.freeDOFs(:));
+        fprintf('Free DOF mapping source: freeDOFs\n');
+    elseif isfield(coarse, 'fixedDOFs') && ~isempty(coarse.fixedDOFs)
+        fixed = unique(double(coarse.fixedDOFs(:)));
+        assert(all(isfinite(fixed) & fixed == floor(fixed) & ...
+                   fixed >= 1 & fixed <= nTotal), ...
+               'Invalid coarsest fixed DOF IDs.');
+        % setdiff returns sorted ascending free DOFs. This fallback assumes
+        % Kfree was assembled in the same ascending DOF order.
+        free = setdiff((1:nTotal)', fixed);
+        assert(numel(free) == nMatrix, ...
+            ['Coarsest fixedDOFs do not explain Kfree dimensions; ' ...
+             'preserve the exact IDs at assembly as KfreeDOFIds.']);
+        warning('MGPU:InferredCoarseDOFs', ...
+            ['Inferring coarse free DOFs from fixedDOFs (ascending order). ' ...
+             'For guaranteed row ordering, store KfreeDOFIds during assembly.']);
+        fprintf('Free DOF mapping source: complement of fixedDOFs\n');
+    else
+        error(['Coarsest Kfree has %d rows but freeDOFs has %d IDs. ' ...
+               'Cannot safely identify its DOF mapping. Save ' ...
+               'meshHierarchy_(end).KfreeDOFIds at assembly time, ' ...
+               'or provide consistent coarse fixedDOFs.'], ...
+               nMatrix, numel(coarse.freeDOFs));
+    end
 
-    assert(isequal(size(solverDataThisTest.coarseKFree), ...
-        [nFree, nFree]), ...
-        'Coarsest matrix dimensions do not match free DOFs.');
+    assert(numel(free) == nMatrix && ...
+           numel(unique(free)) == nMatrix && ...
+           all(isfinite(free) & free == floor(free) & ...
+               free >= 1 & free <= nTotal), ...
+           'Invalid coarsest free DOF IDs.');
 
-    fprintf('Coarsest free DOFs: %d\n', nFree);
-    fprintf('Coarsest matrix NNZ: %d\n', ...
-        nnz(solverDataThisTest.coarseKFree));
+    % The CPU Solving_Vcycle also uses meshHierarchy_(end).freeDOFs.
+    % Keep its RHS indexing consistent with the already-factorized Kfree.
+    meshHierarchy_(end).freeDOFs = free;
+    gpuMeshHierarchy(end).freeDOFs = free;
+
+    solverDataThisTest.coarseKFree = Kfree;
+    solverDataThisTest.coarseFreeDOFIds = int32(free);
+    fprintf('Validated coarse free DOFs: %d\n', numel(free));
+    fprintf('Coarsest matrix NNZ: %d\n', nnz(Kfree));
+
     H_ = Build_GPU_Hierarchy_MGPU_2( ...
-        meshHierarchy_, numGPUs, solverDataThisTest);
+        gpuMeshHierarchy, numGPUs, solverDataThisTest);
     hierarchyTime = toc(hierarchyTimer);
 
     % MATLAB sparse vectors can still be class 'double'. MEX code uses

@@ -217,6 +217,24 @@ for testIndex = 1:numTests
         fprintf('Free DOF mapping source: freeDOFs\n');
     elseif isfield(coarse, 'fixedDOFs') && ~isempty(coarse.fixedDOFs)
         fixed = unique(double(coarse.fixedDOFs(:)));
+        fprintf('\n--- Coarsest fixed DOF diagnostics ---\n');
+
+        fixedRaw = coarse.fixedDOFs;
+
+        fprintf('Class: %s\n', class(fixedRaw));
+        fprintf('Shape: %d x %d\n', size(fixedRaw,1), size(fixedRaw,2));
+        fprintf('Number of entries: %d\n', numel(fixedRaw));
+
+        if isnumeric(fixedRaw) || islogical(fixedRaw)
+            fprintf('Minimum: %.0f\n', min(double(fixedRaw(:))));
+            fprintf('Maximum: %.0f\n', max(double(fixedRaw(:))));
+            fprintf('Number of zeros: %d\n', nnz(fixedRaw == 0));
+            fprintf('Nonfinite entries: %d\n', ...
+                nnz(~isfinite(double(fixedRaw(:)))));
+            fprintf('Entries exceeding numDOFs: %d\n', ...
+                nnz(double(fixedRaw(:)) > double(coarse.numDOFs)));
+            fprintf('Unique entries: %d\n', numel(unique(fixedRaw(:))));
+        end
         assert(all(isfinite(fixed) & fixed == floor(fixed) & ...
                    fixed >= 1 & fixed <= nTotal), ...
                'Invalid coarsest fixed DOF IDs.');

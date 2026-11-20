@@ -161,12 +161,27 @@ for testIndex = 1:numTests
 
     hierarchyTimer = tic;
     fprintf('\n--- Checking multigrid span widths ---\n');
+    coarse = meshHierarchy_(end);
 
+    fprintf('\n--- Coarsest matrix diagnostics ---\n');
+    fprintf('Total coarse DOFs: %d\n', coarse.numDOFs);
+    fprintf('Number of free DOFs: %d\n', numel(coarse.freeDOFs));
+    fprintf('Kfree dimensions: %d x %d\n', ...
+        size(coarse.Kfree, 1), size(coarse.Kfree, 2));
+    fprintf('Solver free DOF IDs: %d\n', ...
+        numel(solverDataThisTest.coarseFreeDOFIds));
+    fprintf('Solver matrix dimensions: %d x %d\n', ...
+        size(solverDataThisTest.coarseKFree, 1), ...
+        size(solverDataThisTest.coarseKFree, 2));
+
+    fprintf('Free DOF range: %d to %d\n', ...
+        min(coarse.freeDOFs), max(coarse.freeDOFs));
     % Convert destination-level spanWidth to source-level convention.
     for level = 1:numel(meshHierarchy_)-1
         meshHierarchy_(level).spanWidth = ...
             meshHierarchy_(level+1).spanWidth;
     end
+
     % Match the CPU Solving_Vcycle Jacobi damping factor exactly.
     % Data_GlobalVariables initializes weightFactorJacobi_ as a global.
     assert(isnumeric(weightFactorJacobi_) && isreal(weightFactorJacobi_) && ...

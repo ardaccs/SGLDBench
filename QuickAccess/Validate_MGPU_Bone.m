@@ -282,7 +282,7 @@ for testIndex = 1:numTests
         'coarseKFree size does not match coarseFreeDOFIds.');
     assert(all(isfinite(nonzeros(H_.coarseKFree))), ...
         'coarseKFree contains NaN or Inf.');
-    %% 5. Prepare per-GPU vectors and validate MEX availability
+    %% 5. Prepare global vectors and validate MEX availability
     mexPath = which(mgpuMexName);
     if isempty(mexPath)
         error(['Multi-GPU MEX ''%s'' was not found. Compile the ' ...
@@ -293,25 +293,24 @@ for testIndex = 1:numTests
         error('MEX %s resolves to %s, not a compiled MEX binary.', ...
             mgpuMexName, mexPath);
     end
+    % This MEX expects two GLOBAL double vectors. Its CUDA initializer
+    % gathers the appropriate local entries using P.globalNodeIds{1}.
     F_ = full(double(F_(:)));
     U0 = full(double(U0(:)));
-    [bGPU, y0GPU] = Split_GPU_Vectors(F_, U0, H_);
-    for g = 1:numGPUs
-        nLocalDOFs = double(H_.partitions{g}.numDOFs(1));
-        assert(isa(bGPU{g}, 'double') && iscolumn(bGPU{g}) && ...
-               numel(bGPU{g}) == nLocalDOFs && ...
-               numel(y0GPU{g}) == nLocalDOFs, ...
-            'Invalid split input vector dimensions for GPU %d.', g);
-    end
+    assert(isreal(F_) && isreal(U0) && ...
+           numel(F_) == globalFinestDOFs && ...
+           numel(U0) == globalFinestDOFs && ...
+           all(isfinite(F_)) && all(isfinite(U0)), ...
+        'MEX expects equal-length finite real global double vectors.');
     fprintf('\nUsing multi-GPU CUDA MEX:\n%s\n', mexPath);
     %% 6. Multi-GPU CUDA solve and global reconstruction
     fprintf('\n--- Running CUDA MGPCG (%d GPUs) ---\n', numGPUs);
     gpuTimer = tic;
-    % The integrated MGPU MEX must accept local b/y0 cell arrays and H.
-    % Preferred first output: one local DOF vector per GPU (cell array).
-    % A fully assembled global DOF vector is also accepted by this validator.
+    % Five inputs: global b, tolerance, max iterations, global y0, H.
+    % The MEX itself splits the vectors across GPUs and assembles a
+    % global displacement vector using ownedNodeMask.
     [U_gpu_raw, gpuIterations, gpuReportedRelres] = feval( ...
-        mgpuMexName, bGPU, tol_, maxIT_, y0GPU, H_);
+        mgpuMexName, F_, tol_, maxIT_, U0, H_);
     gpuTime = toc(gpuTimer);
     assert(isnumeric(gpuIterations) && isscalar(gpuIterations) && ...
            isfinite(gpuIterations) && gpuIterations >= 0 && ...
@@ -452,8 +451,6 @@ for testIndex = 1:numTests
     maximumDifferenceResults(testIndex) = ...
         maximumDifference;
     clear H_;
-    clear bGPU;
-    clear y0GPU;
     clear U_gpu_raw;
     clear U0;
     clear U_cpu;

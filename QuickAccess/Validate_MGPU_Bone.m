@@ -309,6 +309,26 @@ for testIndex = 1:numTests
     % Five inputs: global b, tolerance, max iterations, global y0, H.
     % The MEX itself splits the vectors across GPUs and assembles a
     % global displacement vector using ownedNodeMask.
+    fprintf('\n--- CUDA halo compatibility diagnostics ---\n');
+
+    for g = 1:numGPUs
+        P = H_.partitions{g};
+
+        for l = 1:numLevels
+            map = double(P.nodMapForward{l}(:));
+
+            nNormal = double(P.numNodes(l));
+            nHalo = double(P.numBufferNodes(l));
+
+            fprintf(['GPU %d level %d: normal=%d, halo=%d, ' ...
+                    'maxMap=%d, haloReferences=%d\n'], ...
+                g-1, l, nNormal, nHalo, max(map), ...
+                nnz(map > nNormal));
+
+            assert(all(map >= 0 & map <= nNormal + nHalo), ...
+                'GPU %d level %d has invalid halo indices.', g-1, l);
+        end
+    end
     [U_gpu_raw, gpuIterations, gpuReportedRelres] = feval( ...
         mgpuMexName, F_, tol_, maxIT_, U0, H_);
     gpuTime = toc(gpuTimer);
